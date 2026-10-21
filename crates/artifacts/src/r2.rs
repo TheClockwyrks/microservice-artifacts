@@ -345,7 +345,7 @@ impl R2Client {
     ///
     /// The backend's snapshot refresh is the only caller: after the atomic
     /// `index.json` cut-over it prunes the snapshot generations nothing points at
-    /// any more (see `crate::snapshot::stale_generation_keys` in the backend). Left
+    /// any more (see `snapshot::stale_generation_keys` in microservice-backend). Left
     /// unpruned the bucket grows without bound — every refresh writes a fresh
     /// generation and no earlier one is ever reachable again.
     ///

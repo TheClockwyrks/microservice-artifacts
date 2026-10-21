@@ -1,0 +1,12 @@
+crates/artifacts/
+.env.artifacts.example
+crates/backend/src/access.keys.test.rs
+crates/backend/src/access.rs
+crates/backend/src/access.test.rs
+crates/backend/src/r2.rs
+crates/backend/src/r2.test.rs
+crates/core/src/playable.rs
+crates/core/src/playable.test.rs
+crates/core/src/r2.rs
+crates/core/src/r2.test.rs
+crates/worker/src/error.rs

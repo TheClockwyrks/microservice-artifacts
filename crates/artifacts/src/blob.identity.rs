@@ -8,7 +8,7 @@
 //! `AZURE_FEDERATED_TOKEN_FILE` and, optionally, `AZURE_AUTHORITY_HOST`. The
 //! projected `ServiceAccount` token is exchanged for an access token scoped to
 //! Azure Storage with the federated client-credentials grant, the same exchange
-//! the backend's database identity makes (`crates/db-auth`).
+//! the backend's database identity makes (the superrepo's `crates/db-auth`).
 //!
 //! A token is cached and reused until shortly before it expires, then a fresh
 //! one is minted on the next request. The token file is read on every exchange,

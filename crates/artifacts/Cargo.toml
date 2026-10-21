@@ -1,8 +1,10 @@
 [package]
 name = "test-cabinet-artifacts"
+description = "The artifacts service: the write-through store of run trees and the one writer of both object stores."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [[bin]]

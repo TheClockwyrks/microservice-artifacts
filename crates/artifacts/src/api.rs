@@ -638,7 +638,7 @@ async fn tree_tar(
 /// single gzip tar, for a reviewer pulling a run's produced output onto their
 /// machine.
 ///
-/// This exists to replace a transfer that was becoming unusable:
+/// This exists to replace a transfer that was becoming unusable: the superrepo's
 /// `scripts/extract-cluster-assets.sh` can only reach a deployed cluster through
 /// `az aks command invoke`, which is a command channel with no file channel, so it
 /// moves the tree as base64 over stdout in ~320 KiB chunks — one helper-pod round

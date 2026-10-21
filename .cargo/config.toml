@@ -1,0 +1,34 @@
+# A portable, fully static build of `tcab-artifacts` through the musl target:
+# a static binary has no dynamic linker, so it runs on distributions that do not
+# ship the generic FHS loader, such as NixOS, as well as on mainstream ones. The
+# default build is unchanged, a dynamically linked glibc build.
+#
+# Prerequisites (see
+# https://docs.testcabinet.ai/development/building/#portable-static-builds):
+#   rustup target add x86_64-unknown-linux-musl
+#   a musl C toolchain on PATH (musl-gcc), e.g. Debian/Ubuntu `musl-tools`,
+#   needed because the `ring` TLS backend compiles a little C.
+#
+# Build with:
+#   cargo build-portable-artifacts  # -> target/x86_64-unknown-linux-musl/release/tcab-artifacts
+[alias]
+build-portable-artifacts = "build -p test-cabinet-artifacts --release --target x86_64-unknown-linux-musl"
+
+# Cargo fetches a git dependency through the git on PATH rather than its own
+# client, so a fetch honors the user's git configuration: the SSH agent, and
+# the URL rewrites that send a fetch of a GitHub mirror of a repository of The
+# Test Cabinet to Azure DevOps while the mirrors are private (the superrepo's
+# scripts/repos/sources.py rewrites, and scripts/ci/git-sources.sh in a
+# pipeline).
+[net]
+git-fetch-with-cli = true
+
+# rustdoc documents the private items too, so the `rust-doc` gate holds every
+# doc comment's links, not the public ones alone. The superrepo's
+# .cargo/config.toml sets the same flag, and Cargo reads it as an ancestor
+# configuration inside the superrepo, so a gate run there and the pipeline,
+# which builds this repository on its own, judge the same documentation. There
+# Cargo joins the two lists, and rustdoc takes the repeated flag as one. A
+# `RUSTDOCFLAGS` in the environment, even an empty one, takes precedence.
+[build]
+rustdocflags = ["--document-private-items"]

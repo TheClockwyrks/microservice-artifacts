@@ -1,0 +1,7 @@
+# The kit this repository was rendered from, written by the superrepo's
+# scripts/repos/render.py from the answers in .copier-answers.yml. `name`
+# decides the dependency edges the dependency-edges gate permits, and `kind`
+# the shape the kit gave the repository.
+name = "microservice-artifacts"
+kind = "application"
+description = "The artifacts service: the write-through store of run trees and the one writer of both object stores."
