@@ -2,7 +2,7 @@
 # kit was last rendered or updated from. Copier maintains it through the
 # superrepo's scripts/repos/render.py; a change made here is overwritten by
 # the next update.
-_commit: v0.6.3-5324-gba18562a7
+_commit: v0.6.3-5468-g39f826731
 _src_path: ..
 description: 'The artifacts service: the write-through store of run trees and the
     one writer of both object stores.'
