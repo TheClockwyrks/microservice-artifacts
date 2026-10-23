@@ -34,6 +34,7 @@ fn service(upload_limit: u64) -> Service {
     let state = AppState {
         store: Arc::clone(&store),
         upload_limit,
+        replay_limit: crate::api::MAX_MATCH_REPLAY_BYTES,
         backend_url: Arc::new("http://127.0.0.1:9".to_string()),
         http: reqwest::Client::new(),
         service_token: Some(Arc::new(SERVICE_TOKEN.to_string())),

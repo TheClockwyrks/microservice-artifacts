@@ -28,8 +28,8 @@
 //!   `POST /jobs/{id}/verify-token` ([`verify_job_token`]), the `tree.tar` pull its
 //!   per-publish-job token to `POST /publish-jobs/{id}/verify-token`
 //!   ([`verify_publish_job_token`]), and the tree delete, the `GET /runs`
-//!   listing and `POST /runs/{id}/publish-media` compare the service token
-//!   ([`verify_service_token`]). The backend is the authority for the two job
+//!   listing, `POST /runs/{id}/publish-media` and both tournament match replay
+//!   routes compare the service token ([`verify_service_token`]). The backend is the authority for the two job
 //!   tokens, so [`identify`] lets a bearer it cannot recognise through to these
 //!   routes and the route decides.
 //! - **The public write**, `PUT /public/{key}`, takes a service's identity
@@ -286,7 +286,7 @@ pub async fn verify_publish_job_token(
 }
 
 /// Authorize a control-plane route — the tree delete, the `GET /runs` listing,
-/// `publish-media` — by the shared service token (`TCAB_BACKEND_SERVICE_TOKEN`)
+/// `publish-media`, the tournament match replay write and read — by the shared service token (`TCAB_BACKEND_SERVICE_TOKEN`)
 /// the backend holds. Unlike an upload (a per-job token verified against the
 /// backend), these are the backend acting on its own authority, so they are
 /// gated by the shared secret directly. `expected` is `None` when the service has

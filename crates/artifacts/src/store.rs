@@ -14,6 +14,7 @@
 //! ```text
 //! <id>/current                     the pointer: the generation that is the tree
 //! <id>/g/<generation>/<path>       one object per file of an uploaded tree
+//! tournaments/...                  tournament match replays, never a run
 //! ```
 //!
 //! An upload writes every file of the tree under a fresh generation, and only
@@ -29,6 +30,10 @@
 //! a [`RunTree`]. The objects themselves live in an [`ObjectStore`]: the
 //! [`BlobStore`] in production and the [`MemoryStore`] in tests, so the rules
 //! here are tested by the code that runs.
+//!
+//! The `tournaments/` prefix holds the backend's tournament match replays (see
+//! [`tournaments`]), so `tournaments` is never a run id: a run of that id could
+//! otherwise be listed over the replays, or delete them with its tree.
 //!
 //! The service holds no state of its own: everything a replica knows about a
 //! tree it reads from the container, so any replica answers any request.
@@ -47,6 +52,10 @@ pub use objects::{BlobStore, MemoryStore, ObjectStore};
 #[path = "store.upload.rs"]
 mod upload;
 pub use upload::StoredUpload;
+
+#[path = "store.tournaments.rs"]
+pub mod tournaments;
+use tournaments::TOURNAMENTS;
 
 #[path = "store.archive.rs"]
 mod archive;
@@ -77,6 +86,15 @@ pub enum StoreError {
     /// segment. Refused.
     #[error("`{0}` escapes the run's tree")]
     Traversal(String),
+    /// A run id the store reserves for objects that are not run trees
+    /// ([`tournaments`]'s prefix). Refused, so a run tree can neither be
+    /// written over those objects nor delete them.
+    #[error("`{0}` is reserved and is not a run id")]
+    ReservedId(String),
+    /// A tournament or match id that is not a single safe path segment, so
+    /// would not name one match's replay. Refused.
+    #[error("`{0}` is not a single safe path segment")]
+    UnsafeSegment(String),
     /// The upload is not a readable `tar` archive, or holds no files.
     #[error("the upload is not a usable tar archive: {0}")]
     Archive(String),
@@ -141,7 +159,7 @@ impl ArtifactStore {
     /// The tree replaces any earlier tree of the same id atomically: the files
     /// land under a fresh generation, the pointer is written last, and the
     /// previous generation is deleted after it. An upload that fails or is
-    /// refused (a traversal entry, an unreadable archive, an archive with no
+    /// refused (a reserved or unsafe id, a traversal entry, an unreadable archive, an archive with no
     /// files, a body over `limit`) leaves the earlier tree as it was and the
     /// partly written generation is deleted.
     pub async fn store_run(
@@ -220,7 +238,7 @@ impl ArtifactStore {
 
     /// The stored tree of run `id`: [`StoreError::NotFound`] when it has none,
     /// [`StoreError::Traversal`] for an id that is not a single safe path
-    /// segment.
+    /// segment, [`StoreError::ReservedId`] for a reserved one.
     ///
     /// The two whole-tree downloads stream, so the HTTP layer asks this before
     /// the response begins: once the first byte is on the wire the status code
@@ -241,7 +259,8 @@ impl ArtifactStore {
     /// Remove run `id`'s tree: the pointer first, so no read resolves to the
     /// tree while its objects are deleted, then every object under the id,
     /// including any generation an abandoned upload left. Idempotent: a run with
-    /// no tree is already gone.
+    /// no tree is already gone. A reserved id is refused, so no delete reaches
+    /// the tournament match replays.
     pub async fn delete_run(&self, id: &str) -> Result<(), StoreError> {
         ensure_safe_id(id)?;
         self.objects.delete(&pointer_key(id)).await?;
@@ -255,7 +274,9 @@ impl ArtifactStore {
     /// against its own run rows and deletes what nothing references. A tree is a
     /// run whose pointer exists, so an upload still in flight (its generation
     /// written, its pointer not) is not reported, and an id the store could not
-    /// key by is skipped rather than handed to the sweep.
+    /// key by is skipped rather than handed to the sweep. The `tournaments/`
+    /// prefix is never reported, so the sweep cannot take the tournament match
+    /// replays for an orphaned tree.
     pub async fn list_runs(&self) -> Result<Vec<StoredTree>, StoreError> {
         use futures_util::StreamExt as _;
 
@@ -267,7 +288,7 @@ impl ArtifactStore {
             .prefixes
             .into_iter()
             .filter_map(|prefix| prefix.strip_suffix('/').map(str::to_string))
-            .filter(|id| is_safe_segment(id))
+            .filter(|id| is_run_id(id))
             .collect();
         let objects = &self.objects;
         let results: Vec<Result<Option<StoredTree>, StoreError>> = futures_util::stream::iter(ids)
@@ -433,12 +454,20 @@ fn is_safe_segment(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
 
-/// Refuse an id that is not a single safe path segment.
+/// Whether `id` can key a run tree: a single safe path segment that is not a
+/// prefix the store reserves for other objects.
+fn is_run_id(id: &str) -> bool {
+    is_safe_segment(id) && id != TOURNAMENTS
+}
+
+/// Refuse an id that is not a single safe path segment, or that is reserved.
 fn ensure_safe_id(id: &str) -> Result<(), StoreError> {
-    if is_safe_segment(id) {
-        Ok(())
-    } else {
+    if !is_safe_segment(id) {
         Err(StoreError::Traversal(id.to_string()))
+    } else if !is_run_id(id) {
+        Err(StoreError::ReservedId(id.to_string()))
+    } else {
+        Ok(())
     }
 }
 
