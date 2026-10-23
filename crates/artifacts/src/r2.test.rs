@@ -33,26 +33,38 @@ fn trim_scheme_recovers_host() {
 }
 
 #[test]
-fn parse_list_keys_extracts_every_key() {
+fn parse_list_objects_reads_each_contents_key_size_and_time() {
     let xml = "<?xml version=\"1.0\"?><ListBucketResult>\
-        <Contents><Key>media/runs/a/proof/title.png</Key><Size>1</Size></Contents>\
-        <Contents><Key>media/runs/b/asset/regenerated-0.png</Key></Contents>\
+        <Name>bucket</Name><Prefix>media/</Prefix><KeyCount>2</KeyCount>\
+        <Contents><Key>media/runs/a/proof/title.png</Key>\
+        <LastModified>2026-10-19T12:03:04.000Z</LastModified>\
+        <ETag>&quot;abc&quot;</ETag><Size>1234</Size>\
+        <StorageClass>STANDARD</StorageClass></Contents>\
+        <Contents><Key>media/runs/b/asset/regenerated-0.png</Key><Size>7</Size></Contents>\
         </ListBucketResult>";
     assert_eq!(
-        parse_list_keys(xml),
+        parse_list_objects(xml),
         vec![
-            "media/runs/a/proof/title.png".to_string(),
-            "media/runs/b/asset/regenerated-0.png".to_string(),
+            PublicObject {
+                key: "media/runs/a/proof/title.png".to_string(),
+                bytes: 1234,
+                last_modified: Some(time::macros::datetime!(2026-10-19 12:03:04 UTC)),
+            },
+            PublicObject {
+                key: "media/runs/b/asset/regenerated-0.png".to_string(),
+                bytes: 7,
+                last_modified: None,
+            },
         ],
     );
-    // An empty listing yields no keys.
-    assert!(parse_list_keys("<ListBucketResult></ListBucketResult>").is_empty());
+    // An empty listing yields no objects.
+    assert!(parse_list_objects("<ListBucketResult></ListBucketResult>").is_empty());
 }
 
 #[test]
-fn parse_list_keys_decodes_xml_entities() {
-    let xml = "<Contents><Key>a&amp;b/c.json</Key></Contents>";
-    assert_eq!(parse_list_keys(xml), vec!["a&b/c.json".to_string()]);
+fn parse_list_objects_decodes_xml_entities_in_keys() {
+    let xml = "<Contents><Key>a&amp;b/c.json</Key><Size>0</Size></Contents>";
+    assert_eq!(parse_list_objects(xml)[0].key, "a&b/c.json");
 }
 
 #[test]
@@ -223,8 +235,8 @@ fn an_upload_id_is_read_from_its_element() {
 
 #[test]
 fn xml_escape_is_the_inverse_of_unescape() {
-    // A key carrying every predefined entity round-trips, which is what keeps a
-    // `DeleteObjects` body naming the same object the listing returned.
+    // Text carrying every predefined entity round-trips, which is what keeps a
+    // `CompleteMultipartUpload` body naming the same part the store returned.
     let key = "snapshots/a&b/<c>/\"d\"/'e'.json";
     assert_eq!(xml_unescape(&xml_escape(key)), key);
 }
@@ -232,34 +244,8 @@ fn xml_escape_is_the_inverse_of_unescape() {
 #[test]
 fn xml_escape_does_not_double_escape_ampersands() {
     // `&` must be replaced first; escaping it last would turn the `&` of `&lt;`
-    // into `&amp;lt;` and delete the wrong key.
+    // into `&amp;lt;` and name the wrong part.
     assert_eq!(xml_escape("a&b"), "a&amp;b");
     assert_eq!(xml_escape("a<b"), "a&lt;b");
     assert_eq!(xml_escape("a&<b"), "a&amp;&lt;b");
-}
-
-#[test]
-fn delete_errors_are_none_on_a_quiet_success() {
-    // Quiet mode reports nothing when every key was deleted.
-    assert_eq!(parse_delete_errors(""), None);
-    assert_eq!(
-        parse_delete_errors(r#"<?xml version="1.0"?><DeleteResult></DeleteResult>"#),
-        None
-    );
-}
-
-#[test]
-fn delete_errors_are_counted_when_keys_fail() {
-    let xml = "<DeleteResult>\
-        <Error><Key>a</Key><Code>AccessDenied</Code></Error>\
-        <Error><Key>b</Key><Code>InternalError</Code></Error>\
-        </DeleteResult>";
-    assert_eq!(parse_delete_errors(xml), Some(2));
-}
-
-#[test]
-fn delete_batch_size_matches_the_s3_cap() {
-    // The chunking in `delete_objects` is only correct while this matches the
-    // 1000-key limit S3/R2 enforce per request.
-    assert_eq!(DELETE_BATCH, 1000);
 }

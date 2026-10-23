@@ -757,6 +757,41 @@ fn a_public_key_names_one_object_plainly() {
 }
 
 #[test]
+fn a_public_prefix_names_whole_segments_but_its_last() {
+    for prefix in [
+        "",
+        "media/",
+        "media/runs/r1/",
+        "media/references/sprite-knight/1.0.0/base",
+        "snapshots/2026",
+        "codes/",
+        "index.json",
+    ] {
+        assert_eq!(check_public_prefix(prefix), Ok(()), "{prefix:?}");
+    }
+    for prefix in [
+        "/",
+        "/x",
+        "//",
+        "a/../b",
+        "../a/",
+        "a/./b/",
+        "a//b",
+        "a//",
+        "a\\b",
+        "media/\nruns/",
+        "media/runs\u{0}/",
+    ] {
+        let rejected = check_public_prefix(prefix);
+        assert!(rejected.is_err(), "{prefix:?}");
+        assert!(rejected.unwrap_err().contains("prefix"), "{prefix:?}");
+    }
+    let longest = format!("{}/", "k".repeat(MAX_PUBLIC_KEY_BYTES - 1));
+    assert_eq!(check_public_prefix(&longest), Ok(()));
+    assert!(check_public_prefix(&format!("k{longest}")).is_err());
+}
+
+#[test]
 fn media_is_labelled_by_its_whole_name() {
     let cases = [
         ("a.png", "image/png", None),

@@ -41,6 +41,8 @@ struct Stub {
     page_size: usize,
     /// A part number the stub refuses.
     fail_part: Option<usize>,
+    /// The status a `DeleteObject` is answered with in place of deleting.
+    delete_status: Option<u16>,
 }
 
 type Shared = Arc<Mutex<Stub>>;
@@ -221,18 +223,17 @@ async fn handle(
             );
             status(200, "<CompleteMultipartUploadResult/>")
         }
-        HttpMethod::POST if query.contains_key("delete") => {
-            stub.log.push("POST delete".to_string());
-            let listed = String::from_utf8_lossy(&body).to_string();
-            for part in listed.split("<Key>").skip(1) {
-                let key = part.split("</Key>").next().unwrap_or("");
-                stub.objects.remove(key);
-            }
-            status(200, "")
-        }
         HttpMethod::DELETE if query.contains_key("uploadId") => {
             stub.log.push("DELETE abort".to_string());
             stub.uploads.remove(&query["uploadId"]);
+            status(204, "")
+        }
+        HttpMethod::DELETE if !key.is_empty() && query.is_empty() => {
+            stub.log.push(format!("DELETE {key}"));
+            if let Some(code) = stub.delete_status {
+                return status(code, "<Error><Code>Stubbed</Code></Error>");
+            }
+            stub.objects.remove(&key);
             status(204, "")
         }
         HttpMethod::GET if query.get("list-type").map(String::as_str) == Some("2") => {
@@ -247,7 +248,10 @@ async fn handle(
             let page = stub.page_size.max(1);
             let mut xml = String::from("<ListBucketResult>");
             for key in keys.iter().take(page) {
-                xml.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
+                xml.push_str(&format!(
+                    "<Contents><Key>{key}</Key><LastModified>2026-10-19T12:03:04.000Z</LastModified><Size>{}</Size></Contents>",
+                    stub.objects[*key].data.len()
+                ));
             }
             if keys.len() > page {
                 xml.push_str(&format!(
@@ -458,20 +462,72 @@ async fn a_failed_part_aborts_the_upload() {
 }
 
 #[tokio::test]
-async fn listing_follows_continuation_and_deletes_in_batches() {
+async fn listing_follows_continuation_and_reads_sizes_and_times() {
     let (client, stub) = serve().await;
-    for key in ["media/a", "media/b", "media/c", "other/d"] {
+    for (key, body) in [
+        ("media/a", &b"1"[..]),
+        ("media/b", b"22"),
+        ("media/c", b"333"),
+        ("other/d", b"4444"),
+    ] {
         client
-            .put_object(key, b".".to_vec(), "text/plain", None)
+            .put_object(key, body.to_vec(), "text/plain", None)
             .await
             .unwrap();
     }
     stub.lock().unwrap().page_size = 2;
-    let keys = client.list_keys("media/").await.unwrap();
-    assert_eq!(keys, ["media/a", "media/b", "media/c"]);
+    stub.lock().unwrap().log.clear();
+    let listed = client.list_objects("media/").await.unwrap();
+    let at = Some(time::macros::datetime!(2026-10-19 12:03:04 UTC));
+    assert_eq!(
+        listed,
+        [("media/a", 1), ("media/b", 2), ("media/c", 3)].map(|(key, bytes)| PublicObject {
+            key: key.to_string(),
+            bytes,
+            last_modified: at,
+        })
+    );
+    assert_eq!(stub.lock().unwrap().log, ["GET list", "GET list"]);
+    assert_eq!(client.list_objects("").await.unwrap().len(), 4);
+    assert!(client.list_objects("none/").await.unwrap().is_empty());
+}
 
-    assert_eq!(client.delete_objects(&keys).await.unwrap(), 3);
-    assert_eq!(client.list_keys("").await.unwrap(), ["other/d"]);
+#[tokio::test]
+async fn a_delete_is_one_delete_object_and_a_missing_key_succeeds() {
+    let (client, stub) = serve().await;
+    client
+        .put_object(
+            "snapshots/g1/index.json",
+            b"{}".to_vec(),
+            "text/plain",
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .delete_object("snapshots/g1/index.json")
+        .await
+        .unwrap();
+    assert!(stub.lock().unwrap().objects.is_empty());
+    // S3 answers `204` for a key it does not hold; a `404` is the same outcome.
+    client
+        .delete_object("snapshots/g1/index.json")
+        .await
+        .unwrap();
+    stub.lock().unwrap().delete_status = Some(404);
+    client.delete_object("never/held").await.unwrap();
+    assert_eq!(
+        stub.lock().unwrap().log,
+        [
+            "PUT",
+            "DELETE snapshots/g1/index.json",
+            "DELETE snapshots/g1/index.json",
+            "DELETE never/held",
+        ]
+    );
+    // Any other refusal is an error.
+    stub.lock().unwrap().delete_status = Some(500);
+    assert!(client.delete_object("a").await.is_err());
 }
 
 #[tokio::test]
@@ -513,4 +569,8 @@ async fn the_bucket_serves_as_the_public_store() {
         PublicStore::list_keys(&client, "runs/").await.unwrap(),
         ["runs/r.json"]
     );
+    assert_eq!(PublicStore::list(&client, "").await.unwrap()[0].bytes, 2);
+    PublicStore::delete(&client, "runs/r.json").await.unwrap();
+    PublicStore::delete(&client, "runs/r.json").await.unwrap();
+    assert!(PublicStore::list(&client, "").await.unwrap().is_empty());
 }

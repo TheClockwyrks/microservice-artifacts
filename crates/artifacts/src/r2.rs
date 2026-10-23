@@ -1,40 +1,35 @@
 //! R2 access over the S3-compatible API with AWS SigV4 signing.
 //!
-//! The artifacts service is the object-store writer, so the client is its own.
-//! In the service it is the R2 [public store](crate::public): the public
-//! dataset's documents and media are written through it, read back as streams,
-//! and probed for existence. Two callers outside the service still write R2
-//! directly through it, an interim edge that ends once the backend's dataset
-//! writes and the CLI's reference uploads go through the service's API:
-//!
-//! - The **backend** writes the public snapshot bucket on every refresh, and
-//!   lists it to skip re-uploading content-stable media.
-//! - **`tcab publish-reference`** writes an asset-generation case's reference
-//!   sheet into that same bucket under `media/references/…`. An asset reference
-//!   is regenerated from its committed script rather than committed as bytes, so
-//!   there is nothing in the backend's git checkout for it to publish — the
-//!   publishing side must upload directly.
+//! The artifacts service is the one writer of the public bucket, so the client is
+//! its own. It is the R2 [public store](crate::public): the public dataset's
+//! documents and media are written through it, read back as streams, probed for
+//! existence, listed and deleted. Its callers are this service's own handlers:
+//! `POST /runs/{id}/publish-media` copies a run's media into the bucket,
+//! `PUT /public/{key}` writes one object, `GET /public` lists the objects under a
+//! prefix and `DELETE /public/{key}` deletes one, the last three on behalf of the
+//! backend's publish (and, for `PUT`, the CLI's asset references).
 //!
 //! The verbs are `PutObject` (or a multipart upload for an object larger than
 //! one [piece](crate::object::PIECE_SIZE)), `GetObject`, `HeadObject`,
-//! `ListObjectsV2` and `DeleteObjects`, so rather than pull the full AWS SDK this
+//! `ListObjectsV2` and `DeleteObject`, so rather than pull the full AWS SDK this
 //! module signs requests directly with SigV4 over `hmac`/`sha2` and sends them
 //! with the already-vendored `reqwest`. Every request carries the SHA-256 of its
 //! payload, which a write holds in memory one piece at a time.
 
-use base64::Engine as _;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
+use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 
 use crate::object::{
     ByteRange, ObjectBody, ObjectProperties, ObjectStream, PIECE_SIZE, Pieces, first_pieces,
     properties_from_headers, response_body,
 };
+use crate::public::PublicObject;
 
 /// An R2 request failed: the object store could not be reached, or it rejected a
 /// signed request. Carries the key or prefix
@@ -48,12 +43,10 @@ pub type Result<T, E = R2Error> = std::result::Result<T, E>;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Credentials and addressing for the one R2 bucket the project writes.
-///
-/// Resolved from the same `TCAB_R2_*` environment for every caller, so the
-/// backend's snapshot refresh and `tcab publish-reference` cannot drift onto
-/// different buckets and leave the site pointing at objects that were never
-/// written. Its `Debug` form leaves the secret out.
+/// Credentials and addressing for the one R2 bucket the project writes, resolved
+/// from the service's `TCAB_R2_*` environment. This service is the bucket's one
+/// writer, so no other component holds them. Its `Debug` form leaves the secret
+/// out.
 #[derive(Clone, PartialEq, Eq)]
 pub struct R2Config {
     /// Cloudflare account id (`TCAB_R2_ACCOUNT_ID`); also derives the endpoint.
@@ -126,11 +119,6 @@ const AMZ_DATE: &[FormatItem<'_>] =
 
 /// The S3 service name SigV4 scopes against.
 const SERVICE: &str = "s3";
-
-/// The maximum number of keys one `DeleteObjects` request may carry. S3 caps the
-/// batch at 1000 and R2 implements the same limit, so [`R2Client::delete_objects`]
-/// chunks anything larger.
-const DELETE_BATCH: usize = 1000;
 
 /// The SHA-256 of an empty payload, the payload hash of every bodiless request.
 const EMPTY_PAYLOAD_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -289,20 +277,18 @@ impl R2Client {
         }
     }
 
-    /// List every object key under `prefix`, following the bucket's pagination to
-    /// completion. `GET {endpoint}/{bucket}?list-type=2&prefix=…`, signed with SigV4.
+    /// List every object under `prefix` with its size and last-modified time,
+    /// following the bucket's pagination to completion.
+    /// `GET {endpoint}/{bucket}?list-type=2&prefix=…`, signed with SigV4.
     ///
-    /// Two callers rely on it. The backend's snapshot refresh learns which
-    /// content-stable media objects (`media/runs/<id>/…`) are already uploaded, so it
-    /// references them without re-reading or re-uploading their bytes. Ingest lists
-    /// [`REFERENCE_MEDIA_PREFIX`](test_cabinet_contracts::asset_reference::REFERENCE_MEDIA_PREFIX) to discover which
-    /// asset-generation references have been published, which is why those need no
-    /// committed lockfile.
+    /// The public store's listing: `publish-media` learns which of a run's media
+    /// objects the bucket already holds, and `GET /public` answers the backend's
+    /// listing of a prefix with it.
     ///
     /// Returns an error when a request cannot be sent or R2 responds non-2xx.
-    #[tracing::instrument(name = "r2.list_keys", skip(self), fields(r2.prefix = %prefix), err)]
-    pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+    #[tracing::instrument(name = "r2.list_objects", skip(self), fields(r2.prefix = %prefix), err)]
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<PublicObject>> {
+        let mut objects = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut query = vec![
@@ -330,85 +316,39 @@ impl R2Client {
                 .text()
                 .await
                 .map_err(|e| R2Error(format!("reading the LIST body: {e}")))?;
-            keys.extend(parse_list_keys(&body));
+            objects.extend(parse_list_objects(&body));
             match parse_next_continuation_token(&body) {
                 Some(token) => continuation = Some(token),
                 None => break,
             }
         }
-        Ok(keys)
+        Ok(objects)
     }
 
-    /// Delete every listed key, chunking into 1000-key
-    /// `POST {endpoint}/{bucket}?delete` requests signed with SigV4 (the batch size
-    /// S3 and R2 cap a single request at). Returns the number of keys deleted.
+    /// Delete object `key` (`DeleteObject`, `DELETE {endpoint}/{bucket}/{key}`,
+    /// signed with SigV4).
     ///
-    /// The backend's snapshot refresh is the only caller: after the atomic
-    /// `index.json` cut-over it prunes the snapshot generations nothing points at
-    /// any more (see `snapshot::stale_generation_keys` in microservice-backend). Left
-    /// unpruned the bucket grows without bound — every refresh writes a fresh
-    /// generation and no earlier one is ever reachable again.
-    ///
-    /// A batch that R2 reports a per-key `<Error>` for fails the whole call: the
-    /// caller treats pruning as best-effort and logs, so a partial delete simply
-    /// leaves the remainder for the next refresh to retry.
-    #[tracing::instrument(
-        name = "r2.delete_objects",
-        skip(self, keys),
-        fields(r2.keys = keys.len()),
-        err,
-    )]
-    pub async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        let mut deleted = 0;
-        for chunk in keys.chunks(DELETE_BATCH) {
-            self.delete_batch(chunk).await?;
-            deleted += chunk.len();
-        }
-        Ok(deleted)
-    }
-
-    /// Delete one batch of at most [`DELETE_BATCH`] keys.
-    ///
-    /// Unlike the reads this signs a request *body*, and S3 additionally
-    /// authenticates that body with a `Content-MD5` header which must itself be in
-    /// `SignedHeaders`. `<Quiet>true</Quiet>` suppresses a success element per key,
-    /// leaving a response body that is empty unless something failed.
-    async fn delete_batch(&self, keys: &[String]) -> Result<()> {
-        let mut body =
-            String::from(r#"<?xml version="1.0" encoding="UTF-8"?><Delete><Quiet>true</Quiet>"#);
-        for key in keys {
-            body.push_str("<Object><Key>");
-            body.push_str(&xml_escape(key));
-            body.push_str("</Key></Object>");
-        }
-        body.push_str("</Delete>");
-        let body = Bytes::from(body);
-        let payload_hash = hex::encode(Sha256::digest(&body));
-        let content_md5 = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body));
-
+    /// The public store's delete, which `DELETE /public/{key}` answers the
+    /// backend's prune of superseded snapshot generations with. Deleting a key the
+    /// bucket does not hold succeeds: S3 answers `204` for it, and a `404` is
+    /// taken as the same outcome.
+    #[tracing::instrument(name = "r2.delete_object", skip(self), fields(r2.key = %key), err)]
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
         let response = self
             .execute(
-                Method::POST,
+                Method::DELETE,
+                Some(key),
+                &[],
+                Vec::new(),
+                Vec::new(),
+                EMPTY_PAYLOAD_HASH,
                 None,
-                &[("delete", String::new())],
-                vec![("content-md5".to_string(), content_md5)],
-                vec![("content-type", "application/xml".to_string())],
-                &payload_hash,
-                Some(body),
             )
             .await?;
-        if !response.status().is_success() {
-            return Err(status_error("DELETE batch", "", response).await);
+        match response.status().as_u16() {
+            200 | 202 | 204 | 404 => Ok(()),
+            _ => Err(status_error("DELETE", key, response).await),
         }
-        // A quiet-mode success body carries no elements; anything reported is a
-        // per-key failure the caller must not mistake for a completed prune.
-        let detail = response.text().await.unwrap_or_default();
-        if let Some(failures) = parse_delete_errors(&detail) {
-            return Err(R2Error(format!(
-                "DELETE batch reported {failures} per-key error(s): {detail}"
-            )));
-        }
-        Ok(())
     }
 
     /// One `PutObject` of a body held in memory, its SHA-256 signed.
@@ -790,22 +730,34 @@ fn xml_element(xml: &str, name: &str) -> Option<String> {
     Some(xml_unescape(&after[..after.find(&close)?]))
 }
 
-/// Extract every `<Key>…</Key>` value from a `ListObjectsV2` XML response body,
-/// decoding the handful of XML entities S3 escapes keys with. The keys this bucket
-/// holds are traversal-free ASCII paths, so this deliberately avoids pulling an XML
-/// parser for what is a flat scan of one repeated element.
-fn parse_list_keys(xml: &str) -> Vec<String> {
-    let mut keys = Vec::new();
+/// Every `<Contents>` element of a `ListObjectsV2` XML response body, as the
+/// object's key, its `<Size>` and its `<LastModified>` (ISO 8601), decoding the
+/// handful of XML entities S3 escapes keys with. The keys this bucket holds are
+/// traversal-free paths, so this is a flat scan of one repeated element rather
+/// than a parse through an XML library. A size that does not parse is `0`, and a
+/// time that does not parse is `None`.
+fn parse_list_objects(xml: &str) -> Vec<PublicObject> {
+    let mut objects = Vec::new();
     let mut rest = xml;
-    while let Some(open) = rest.find("<Key>") {
-        let after = &rest[open + "<Key>".len()..];
-        let Some(close) = after.find("</Key>") else {
+    while let Some(open) = rest.find("<Contents>") {
+        let after = &rest[open + "<Contents>".len()..];
+        let Some(close) = after.find("</Contents>") else {
             break;
         };
-        keys.push(xml_unescape(&after[..close]));
-        rest = &after[close + "</Key>".len()..];
+        let contents = &after[..close];
+        if let Some(key) = xml_element(contents, "Key") {
+            objects.push(PublicObject {
+                key,
+                bytes: xml_element(contents, "Size")
+                    .and_then(|size| size.trim().parse().ok())
+                    .unwrap_or(0),
+                last_modified: xml_element(contents, "LastModified")
+                    .and_then(|at| OffsetDateTime::parse(at.trim(), &Rfc3339).ok()),
+            });
+        }
+        rest = &after[close + "</Contents>".len()..];
     }
-    keys
+    objects
 }
 
 /// The `<NextContinuationToken>` of a truncated `ListObjectsV2` response, or `None`
@@ -818,16 +770,8 @@ fn parse_next_continuation_token(xml: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
-/// The number of `<Error>` elements in a `DeleteObjects` response, or `None` when
-/// the batch fully succeeded. In quiet mode a clean delete reports nothing at all,
-/// so any `<Error>` present means some keys survived.
-fn parse_delete_errors(xml: &str) -> Option<usize> {
-    let count = xml.matches("<Error>").count();
-    (count > 0).then_some(count)
-}
-
-/// Escape an object key for inclusion in a `DeleteObjects` request body. `&` is
-/// escaped first so the ampersands introduced by the later replacements are not
+/// Escape text for inclusion in a request body's XML element. `&` is escaped
+/// first so the ampersands introduced by the later replacements are not
 /// double-escaped. The inverse of [`xml_unescape`].
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")

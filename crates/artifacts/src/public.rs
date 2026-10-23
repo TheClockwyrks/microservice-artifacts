@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use time::OffsetDateTime;
 
 use crate::blob::{BlobClient, BlobError};
 use crate::object::{
@@ -46,6 +47,17 @@ pub enum PublicStoreConfig {
     },
 }
 
+/// One object of a [`PublicStore`] listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicObject {
+    /// The object's key.
+    pub key: String,
+    /// Its size in bytes.
+    pub bytes: u64,
+    /// When it was last written, when the store reports it.
+    pub last_modified: Option<OffsetDateTime>,
+}
+
 /// The public dataset's store.
 #[async_trait::async_trait]
 pub trait PublicStore: Send + Sync {
@@ -74,8 +86,22 @@ pub trait PublicStore: Send + Sync {
     /// Read object `key`'s properties; `Ok(None)` when there is no such object.
     async fn head(&self, key: &str) -> Result<Option<ObjectProperties>, PublicStoreError>;
 
+    /// Every object under `prefix`, in name order, the store's paging followed
+    /// to the end.
+    async fn list(&self, prefix: &str) -> Result<Vec<PublicObject>, PublicStoreError>;
+
     /// Every object key under `prefix`, in name order.
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PublicStoreError>;
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PublicStoreError> {
+        Ok(self
+            .list(prefix)
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect())
+    }
+
+    /// Delete object `key`. Deleting a key the store does not hold succeeds.
+    async fn delete(&self, key: &str) -> Result<(), PublicStoreError>;
 }
 
 #[async_trait::async_trait]
@@ -108,8 +134,12 @@ impl PublicStore for R2Client {
         Ok(self.head_object(key).await?)
     }
 
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PublicStoreError> {
-        Ok(R2Client::list_keys(self, prefix).await?)
+    async fn list(&self, prefix: &str) -> Result<Vec<PublicObject>, PublicStoreError> {
+        Ok(self.list_objects(prefix).await?)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PublicStoreError> {
+        Ok(self.delete_object(key).await?)
     }
 }
 
@@ -143,14 +173,22 @@ impl PublicStore for BlobClient {
         Ok(self.properties(key).await?)
     }
 
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PublicStoreError> {
-        Ok(self
-            .list(prefix, None)
+    async fn list(&self, prefix: &str) -> Result<Vec<PublicObject>, PublicStoreError> {
+        Ok(BlobClient::list(self, prefix, None)
             .await?
             .blobs
             .into_iter()
-            .map(|blob| blob.name)
+            .map(|blob| PublicObject {
+                key: blob.name,
+                bytes: blob.properties.content_length,
+                last_modified: blob.properties.last_modified,
+            })
             .collect())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PublicStoreError> {
+        BlobClient::delete(self, key).await?;
+        Ok(())
     }
 }
 
@@ -185,7 +223,12 @@ pub struct MemoryObject {
 pub struct MemoryPublicStore {
     objects: Arc<Mutex<BTreeMap<String, MemoryObject>>>,
     writes: Arc<Mutex<Vec<String>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
 }
+
+/// The last-modified time a [`MemoryPublicStore`] reports for every object it
+/// lists: 2026-01-01T00:00:00Z.
+pub const MEMORY_LAST_MODIFIED: OffsetDateTime = time::macros::datetime!(2026-01-01 00:00:00 UTC);
 
 impl MemoryPublicStore {
     /// An empty store.
@@ -219,6 +262,15 @@ impl MemoryPublicStore {
     /// Every key written through [`PublicStore::put`], in the order written.
     pub fn writes(&self) -> Vec<String> {
         self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every key deleted through [`PublicStore::delete`], in the order deleted,
+    /// whether or not the store held it.
+    pub fn deletes(&self) -> Vec<String> {
+        self.deletes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -304,13 +356,26 @@ impl PublicStore for MemoryPublicStore {
         Ok(self.lock().get(key).map(Self::properties))
     }
 
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PublicStoreError> {
+    async fn list(&self, prefix: &str) -> Result<Vec<PublicObject>, PublicStoreError> {
         Ok(self
             .lock()
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, object)| PublicObject {
+                key: key.clone(),
+                bytes: object.body.len() as u64,
+                last_modified: Some(MEMORY_LAST_MODIFIED),
+            })
             .collect())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PublicStoreError> {
+        self.lock().remove(key);
+        self.deletes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key.to_string());
+        Ok(())
     }
 }
 

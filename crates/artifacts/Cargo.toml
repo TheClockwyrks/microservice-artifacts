@@ -56,11 +56,10 @@ reqwest = { workspace = true }
 # Verifies the Cloudflare Access assertion every edge request carries (`src/access.rs`).
 jsonwebtoken = { workspace = true }
 # SigV4 signing for the R2 client (`r2`): signing the handful of requests directly
-# is far cheaper than vendoring the AWS SDK for three verbs.
+# is far cheaper than vendoring the AWS SDK for a handful of verbs.
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
-md-5 = { workspace = true }
 base64 = { workspace = true }
 # `tar` (pure Rust, no system deps) reads the run-artifact tree the driver
 # streams up as a tarball, and frames the whole-tree downloads — the same crate the

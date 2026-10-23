@@ -1,5 +1,6 @@
-//! The gg session record and code analysis reads, `publish-media`, and the
-//! public write, driven through the real router over stores held in memory.
+//! The gg session record and code analysis reads, `publish-media`, the public
+//! write, and the public listing and delete, driven through the real router over
+//! stores held in memory.
 
 use std::sync::Arc;
 
@@ -429,4 +430,225 @@ async fn a_public_write_over_the_limit_is_refused_and_leaves_the_old_object() {
     )
     .await;
     assert_eq!(answer.status, StatusCode::CREATED);
+}
+
+/// `Authorization: Bearer` [`SERVICE_TOKEN`].
+const BACKEND: [(&str, &str); 1] = [("authorization", "Bearer service-secret")];
+
+#[tokio::test]
+async fn listing_the_public_store_answers_a_prefixs_objects_with_sizes_and_times() {
+    let service = service(MAX_UPLOAD_BYTES);
+    service
+        .public
+        .insert("media/runs/r1/proof/a.png", b"12345", "image/png");
+    service
+        .public
+        .insert("media/runs/r1/proof/b.png", b"1", "image/png");
+    service
+        .public
+        .insert("media/runs/r2/proof/a.png", b"123", "image/png");
+    service
+        .public
+        .insert("index.json", b"{}", "application/json");
+
+    for prefix in ["", "/artifacts"] {
+        let uri = format!("{prefix}/public?prefix=media/runs/r1/");
+        let answer = send(&service.app, "GET", &uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            answer.json(),
+            serde_json::json!({ "objects": [
+                {
+                    "key": "media/runs/r1/proof/a.png",
+                    "bytes": 5,
+                    "modifiedAt": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "key": "media/runs/r1/proof/b.png",
+                    "bytes": 1,
+                    "modifiedAt": "2026-01-01T00:00:00Z",
+                },
+            ]}),
+            "{uri}"
+        );
+    }
+
+    // A partial last segment matches as a plain prefix.
+    let answer = send(
+        &service.app,
+        "GET",
+        "/public?prefix=media/runs/r",
+        &BACKEND,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(answer.json()["objects"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn an_absent_or_empty_prefix_lists_the_whole_store() {
+    let service = service(MAX_UPLOAD_BYTES);
+    service
+        .public
+        .insert("index.json", b"{}", "application/json");
+    service.public.insert("codes/abc", b"r1", "text/plain");
+    for uri in ["/public", "/public?prefix=", "/artifacts/public"] {
+        let answer = send(&service.app, "GET", uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::OK, "{uri}");
+        let keys: Vec<String> = answer.json()["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, ["codes/abc", "index.json"], "{uri}");
+    }
+
+    // A prefix nothing is under answers an empty listing, not a 404.
+    let answer = send(
+        &service.app,
+        "GET",
+        "/public?prefix=media/",
+        &BACKEND,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.json(), serde_json::json!({ "objects": [] }));
+}
+
+#[tokio::test]
+async fn a_prefix_that_does_not_name_whole_segments_plainly_is_a_400() {
+    let service = service(MAX_UPLOAD_BYTES);
+    for prefix in ["/x", "a/../b", "a%5Cb", "a//b", "%2F", "media/%0Aruns/"] {
+        let uri = format!("/public?prefix={prefix}");
+        let answer = send(&service.app, "GET", &uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(answer.json()["error"]["code"], "bad_request", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_public_object_is_idempotent() {
+    let service = service(MAX_UPLOAD_BYTES);
+    service
+        .public
+        .insert("snapshots/g1/runs/r1.json", b"{}", "application/json");
+    service
+        .public
+        .insert("snapshots/g2/runs/r1.json", b"{}", "application/json");
+
+    let answer = send(
+        &service.app,
+        "DELETE",
+        "/public/snapshots/g1/runs/r1.json",
+        &BACKEND,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT);
+    assert!(answer.body.is_empty());
+    assert_eq!(service.public.keys(), ["snapshots/g2/runs/r1.json"]);
+
+    // Deleting it again, or a key never held, still succeeds; under the edge
+    // prefix too.
+    for uri in [
+        "/public/snapshots/g1/runs/r1.json",
+        "/artifacts/public/snapshots/g1/runs/r1.json",
+        "/public/never/held.json",
+    ] {
+        let answer = send(&service.app, "DELETE", uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{uri}");
+    }
+    let answer = send(
+        &service.app,
+        "DELETE",
+        "/artifacts/public/snapshots/g2/runs/r1.json",
+        &BACKEND,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT);
+    assert!(service.public.keys().is_empty());
+    assert_eq!(
+        service.public.deletes(),
+        [
+            "snapshots/g1/runs/r1.json",
+            "snapshots/g1/runs/r1.json",
+            "snapshots/g1/runs/r1.json",
+            "never/held.json",
+            "snapshots/g2/runs/r1.json",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_bad_key_is_a_400_and_deletes_nothing() {
+    let service = service(MAX_UPLOAD_BYTES);
+    service
+        .public
+        .insert("index.json", b"{}", "application/json");
+    for uri in [
+        "/public/media/../index.json",
+        "/public/media/./index.json",
+        "/public/media//index.json",
+        "/public/media/",
+        "/public/media%5Cindex.json",
+    ] {
+        let answer = send(&service.app, "DELETE", uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert!(service.public.deletes().is_empty());
+    assert_eq!(service.public.keys(), ["index.json"]);
+}
+
+#[tokio::test]
+async fn listing_and_deleting_refuse_a_missing_or_wrong_token() {
+    let service = service(MAX_UPLOAD_BYTES);
+    service
+        .public
+        .insert("index.json", b"{}", "application/json");
+    for headers in [
+        vec![],
+        vec![("authorization", "Bearer wrong")],
+        // A person's identity on a service with no Access application.
+        READER.to_vec(),
+    ] {
+        for (method, uri) in [
+            ("GET", "/public?prefix="),
+            ("GET", "/artifacts/public"),
+            ("DELETE", "/public/index.json"),
+            ("DELETE", "/artifacts/public/index.json"),
+        ] {
+            let answer = send(&service.app, method, uri, &headers, Body::empty()).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} {headers:?}"
+            );
+        }
+    }
+    assert!(service.public.deletes().is_empty());
+    assert_eq!(service.public.keys(), ["index.json"]);
+}
+
+#[tokio::test]
+async fn a_service_with_no_token_refuses_every_listing_and_delete() {
+    let public = MemoryPublicStore::new();
+    public.insert("index.json", b"{}", "application/json");
+    let app = router(AppState {
+        store: Arc::new(ArtifactStore::new(Arc::new(MemoryStore::new()))),
+        upload_limit: MAX_UPLOAD_BYTES,
+        backend_url: Arc::new("http://127.0.0.1:9".to_string()),
+        http: reqwest::Client::new(),
+        service_token: None,
+        access: None,
+        public: Arc::new(public.clone()),
+        transcoder: Arc::new(FakeTranscoder::working()),
+    });
+    for (method, uri) in [("GET", "/public"), ("DELETE", "/public/index.json")] {
+        let answer = send(&app, method, uri, &BACKEND, Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+    assert_eq!(public.keys(), ["index.json"]);
 }

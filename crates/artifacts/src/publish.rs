@@ -257,6 +257,27 @@ pub fn check_public_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `prefix` may be listed by `GET /public?prefix=`: empty (the whole
+/// bucket), or a value [`check_public_key`] accepts once one trailing `/` is
+/// removed. A prefix therefore names whole segments the way a key does, except
+/// that its last segment may be partial.
+pub fn check_public_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if prefix.len() > MAX_PUBLIC_KEY_BYTES {
+        return Err(format!(
+            "the prefix is {} bytes, over the {MAX_PUBLIC_KEY_BYTES}-byte limit",
+            prefix.len()
+        ));
+    }
+    let stem = prefix.strip_suffix('/').unwrap_or(prefix);
+    if stem.is_empty() {
+        return Err("the prefix starts with `/`".to_string());
+    }
+    check_public_key(stem).map_err(|reason| reason.replacen("the key", "the prefix", 1))
+}
+
 /// Which list of [`PublishedMedia`] an entry lands in, with what it is named
 /// by there.
 enum RunMediaEntry {
