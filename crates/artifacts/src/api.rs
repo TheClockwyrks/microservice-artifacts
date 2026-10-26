@@ -46,7 +46,8 @@
 //! Every route is served at the root, which is what an in-cluster caller uses, and
 //! under the edge's [`/artifacts`](crate::auth::EDGE_PREFIX) prefix, which
 //! `cloudflared` forwards unchanged. [`crate::auth::identify`] runs in front of all
-//! of them; `/healthz` alone is served without an identity.
+//! of them; the two probes, `/healthz` (liveness) and `/readyz` (readiness), alone
+//! are served without an identity.
 //!
 //! The serve handlers resolve the run's stored tree once, through its pointer
 //! (see [`crate::store`]), and read it through the [`playable`](crate::playable)
@@ -71,6 +72,8 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+use crate::shutdown::Readiness;
 
 use crate::playable::{
     Served, find_build_output, serve_asset_file, serve_build_file, serve_proof_file,
@@ -314,6 +317,9 @@ pub struct AppState {
     pub public: Arc<dyn PublicStore>,
     /// What transcodes a published webm clip to mp4.
     pub transcoder: Arc<dyn Transcoder>,
+    /// Whether the service takes new requests, which `GET /readyz` answers; failed
+    /// once the service is told to stop (see [`crate::shutdown`]).
+    pub readiness: Readiness,
 }
 
 /// Every route of the service, served by [`router`] at the root and under the
@@ -322,6 +328,7 @@ pub struct AppState {
 fn routes() -> Router<AppState> {
     let token_routes = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         // Upload a finished run's collected tree (driver → service, per-job token),
         // or delete it (backend → service, shared control-plane service token) when
         // the control plane deletes the run.
@@ -433,9 +440,25 @@ async fn accept_trace(request: Request, next: axum::middleware::Next) -> Respons
     next.run(request).await
 }
 
-/// Liveness/readiness probe.
+/// `GET /healthz` — the liveness probe: `200` while the process serves,
+/// draining included.
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `GET /readyz` — the readiness probe: `200` until the service is told to stop,
+/// `503` from that moment on, so its endpoint leaves the `Service` while the
+/// requests it holds finish (see [`crate::shutdown`]).
+async fn readyz(State(state): State<AppState>) -> Response {
+    if state.readiness.is_ready() {
+        Json(serde_json::json!({ "status": "ok" })).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "draining" })),
+        )
+            .into_response()
+    }
 }
 
 /// The header a driver sets to its **job id** on an upload, so the service can

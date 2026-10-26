@@ -1,7 +1,10 @@
 //! The `tcab-artifacts` binary entrypoint.
 //!
 //! Resolves configuration from the environment, builds the service, and serves
-//! the Axum router until terminated. Every route but the health probe needs an
+//! the Axum router until told to stop, then drains: `SIGTERM` fails readiness at
+//! once, keeps accepting for the drain delay, then stops accepting and finishes
+//! every request in flight before exiting 0; `Ctrl-C` skips the delay (see
+//! [`test_cabinet_artifacts::shutdown`]). Every route but the health probe needs an
 //! identity: the Access assertion an edge request carries, verified against
 //! `TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE`, or one of the in-cluster
 //! tokens (see [`test_cabinet_artifacts::auth`]). A configuration naming only one of
@@ -104,9 +107,22 @@ async fn main() -> ExitCode {
     };
     tracing::info!("artifact service listening on {}", service.bind);
 
-    if let Err(err) = axum::serve(listener, service.router).await {
+    // Told to stop, fail readiness so the endpoint leaves the Service, keep
+    // accepting for the drain delay, then stop accepting and finish the requests in
+    // flight before exiting (the control plane's "Graceful termination").
+    let shutdown = test_cabinet_artifacts::shutdown::drain(
+        service.readiness,
+        test_cabinet_artifacts::shutdown::stop_requested(),
+    );
+    if let Err(err) = axum::serve(listener, service.router)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+        })
+        .await
+    {
         eprintln!("server error: {err}");
         return ExitCode::FAILURE;
     }
+    tracing::info!("artifact service stopped");
     ExitCode::SUCCESS
 }

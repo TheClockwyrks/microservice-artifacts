@@ -84,6 +84,7 @@ async fn service(access: AccessMode) -> (MemoryStore, Router) {
         access,
         public: Arc::new(crate::public::MemoryPublicStore::new()),
         transcoder: Arc::new(crate::publish::testing::FakeTranscoder::working()),
+        readiness: crate::shutdown::Readiness::new(),
     };
     (objects, router(state))
 }
@@ -167,7 +168,12 @@ fn only_the_probes_are_exempt() {
 #[tokio::test]
 async fn the_probe_answers_without_an_identity_at_the_root_and_under_the_prefix() {
     for (_dir, app) in [local_service().await, verifying_service().await] {
-        for uri in ["/healthz", "/artifacts/healthz"] {
+        for uri in [
+            "/healthz",
+            "/artifacts/healthz",
+            "/readyz",
+            "/artifacts/readyz",
+        ] {
             assert_eq!(get(&app, uri, &[]).await.0, StatusCode::OK, "{uri}");
         }
     }

@@ -42,6 +42,7 @@ fn service(upload_limit: u64) -> Service {
         access: None,
         public: Arc::new(public.clone()),
         transcoder: Arc::new(FakeTranscoder::working()),
+        readiness: crate::shutdown::Readiness::new(),
     };
     Service {
         app: router(state),
@@ -647,6 +648,7 @@ async fn a_service_with_no_token_refuses_every_listing_and_delete() {
         access: None,
         public: Arc::new(public.clone()),
         transcoder: Arc::new(FakeTranscoder::working()),
+        readiness: crate::shutdown::Readiness::new(),
     });
     for (method, uri) in [("GET", "/public"), ("DELETE", "/public/index.json")] {
         let answer = send(&app, method, uri, &BACKEND, Body::empty()).await;

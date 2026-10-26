@@ -141,6 +141,7 @@ pub(super) async fn app_with_limit(
         access: None,
         public: Arc::new(crate::public::MemoryPublicStore::new()),
         transcoder: Arc::new(crate::publish::testing::FakeTranscoder::working()),
+        readiness: crate::shutdown::Readiness::new(),
     };
     (router(state), store, objects)
 }
@@ -1129,4 +1130,44 @@ async fn listing_when_no_service_token_is_configured_is_disabled() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn readiness_fails_once_draining_while_liveness_holds() {
+    let readiness = crate::shutdown::Readiness::new();
+    let app = router(AppState {
+        store: Arc::new(ArtifactStore::new(Arc::new(MemoryStore::new()))),
+        upload_limit: MAX_UPLOAD_BYTES,
+        replay_limit: MAX_MATCH_REPLAY_BYTES,
+        backend_url: Arc::new("http://127.0.0.1:9".to_string()),
+        http: reqwest::Client::new(),
+        service_token: None,
+        access: None,
+        public: Arc::new(crate::public::MemoryPublicStore::new()),
+        transcoder: Arc::new(crate::publish::testing::FakeTranscoder::working()),
+        readiness: readiness.clone(),
+    });
+    let status = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for uri in ["/readyz", "/artifacts/readyz", "/healthz"] {
+        assert_eq!(status(uri).await, StatusCode::OK, "{uri} before the stop");
+    }
+    readiness.mark_draining();
+    for uri in ["/readyz", "/artifacts/readyz"] {
+        assert_eq!(
+            status(uri).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} while draining"
+        );
+    }
+    for uri in ["/healthz", "/artifacts/healthz"] {
+        assert_eq!(status(uri).await, StatusCode::OK, "{uri} while draining");
+    }
 }

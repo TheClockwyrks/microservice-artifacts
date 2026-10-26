@@ -41,6 +41,8 @@
 //!   reachable without one but the health probe.
 //! - [`access`] — the verification of the Cloudflare Access assertion.
 //! - [`config`] — the environment-sourced configuration.
+//! - [`shutdown`] — stopping on `SIGTERM` without failing a request: readiness
+//!   failed at once, a drain delay, then the requests in flight finished.
 
 pub mod access;
 pub mod api;
@@ -53,6 +55,7 @@ pub mod playable;
 pub mod public;
 pub mod publish;
 pub mod r2;
+pub mod shutdown;
 pub mod store;
 
 use std::sync::Arc;
@@ -61,6 +64,7 @@ use crate::access::AccessVerifier;
 use crate::api::AppState;
 use crate::blob::{BlobClient, BlobError};
 use crate::config::Config;
+use crate::shutdown::Readiness;
 use crate::store::{ArtifactStore, BlobStore};
 
 /// A fully wired, runnable artifact service: the Axum router plus its resolved
@@ -70,6 +74,8 @@ pub struct ArtifactService {
     pub router: axum::Router,
     /// The bind address resolved from configuration.
     pub bind: String,
+    /// The readiness the router's `GET /readyz` answers, which the stop fails.
+    pub readiness: Readiness,
 }
 
 /// Make the run-tree container ready to serve from, before the service
@@ -98,6 +104,7 @@ pub async fn prepare_run_container(config: &Config) -> Result<Vec<String>, BlobE
 /// the service refuses to start rather than fail every request later.
 pub fn build(config: Config) -> Result<ArtifactService, BlobError> {
     let bind = config.bind.clone();
+    let readiness = Readiness::new();
     let http = reqwest::Client::new();
     let runs = BlobClient::new(&config.blob, http.clone())?;
     let public = public::open(&config.public_store, &runs);
@@ -116,9 +123,11 @@ pub fn build(config: Config) -> Result<ArtifactService, BlobError> {
         access,
         public,
         transcoder: Arc::new(publish::Ffmpeg::new()),
+        readiness: readiness.clone(),
     };
     Ok(ArtifactService {
         router: api::router(state),
         bind,
+        readiness,
     })
 }
