@@ -77,6 +77,7 @@ async fn service(access: AccessMode) -> (MemoryStore, Router) {
     let state = AppState {
         store: Arc::new(store),
         upload_limit: crate::api::MAX_UPLOAD_BYTES,
+        replay_limit: crate::api::MAX_MATCH_REPLAY_BYTES,
         backend_url: Arc::new(stub_backend().await),
         http: reqwest::Client::new(),
         service_token: Some(Arc::new(SERVICE_TOKEN.to_string())),

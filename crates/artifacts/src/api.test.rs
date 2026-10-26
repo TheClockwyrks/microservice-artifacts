@@ -121,8 +121,8 @@ pub(super) async fn app_with_service_token(
     app_with_limit(stub_url, service_token, MAX_UPLOAD_BYTES).await
 }
 
-/// As [`app_with_service_token`], accepting uploads of at most `upload_limit`
-/// bytes.
+/// As [`app_with_service_token`], accepting uploads and match replays of at most
+/// `upload_limit` bytes.
 pub(super) async fn app_with_limit(
     stub_url: &str,
     service_token: Option<&str>,
@@ -133,6 +133,8 @@ pub(super) async fn app_with_limit(
     let state = AppState {
         store: Arc::clone(&store),
         upload_limit,
+        // One limit for every body a test sends, so a test of the cap sets it once.
+        replay_limit: upload_limit,
         backend_url: Arc::new(stub_url.trim_end_matches('/').to_string()),
         http: reqwest::Client::new(),
         service_token: service_token.map(|t| Arc::new(t.to_string())),
@@ -699,7 +701,7 @@ async fn uploading_without_the_job_id_header_is_rejected() {
 }
 
 /// Upload a stored tree under `run_id` so a delete test has something to remove.
-async fn seed_upload(app: &Router, run_id: &str) {
+pub(super) async fn seed_upload(app: &Router, run_id: &str) {
     let upload = Request::builder()
         .method("POST")
         .uri(format!("/runs/{run_id}/artifacts"))

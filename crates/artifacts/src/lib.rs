@@ -109,6 +109,7 @@ pub fn build(config: Config) -> Result<ArtifactService, BlobError> {
     let state = AppState {
         store: Arc::new(store),
         upload_limit: api::MAX_UPLOAD_BYTES,
+        replay_limit: api::MAX_MATCH_REPLAY_BYTES,
         backend_url: Arc::new(config.backend_url),
         http,
         service_token: config.service_token.map(Arc::new),

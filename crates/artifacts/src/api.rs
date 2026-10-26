@@ -34,6 +34,10 @@
 //!   `PUT /public/{key}`; the **CLI** writes an asset reference with the same
 //!   route, through the edge with an Access service token (see
 //!   [`crate::publish`]).
+//! - The **backend** stores each tournament match's replay as the arena reports
+//!   it, `PUT /tournaments/{id}/matches/{matchId}/replay`, and reads it back to
+//!   serve it, `GET` of the same path, both with the service token (see
+//!   [`crate::store::tournaments`]).
 //!
 //! Every route is served at the root, which is what an in-cluster caller uses, and
 //! under the edge's [`/artifacts`](crate::auth::EDGE_PREFIX) prefix, which
@@ -76,6 +80,7 @@ use crate::auth::{
 use crate::error::ApiError;
 use crate::public::PublicStore;
 use crate::publish::{PublishError, Transcoder, check_public_key, publish_run_media};
+use crate::store::tournaments::MATCH_REPLAY_CONTENT_TYPE;
 use crate::store::{ArchiveShape, ArtifactStore, StoreError, start_archive, write_archive};
 
 /// The maximum size of an uploaded run tree's `tar` body, in bytes. A run's
@@ -90,6 +95,13 @@ use crate::store::{ArchiveShape, ArtifactStore, StoreError, start_archive, write
 /// extractors that buffer (`Bytes`, `String`, `Json`) and is inert against the raw
 /// `Body` the upload handler takes.
 pub const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The maximum size of a tournament match's replay, in bytes: the bound the
+/// backend has always accepted a replay under. A replay is a match's recorded
+/// ticks as JSON, far smaller than a run tree. As for an upload, the body is
+/// streamed into the private container and the cap is applied as it is read, so
+/// it bounds the object rather than memory.
+pub const MAX_MATCH_REPLAY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How much of a streamed archive is accumulated before a chunk is handed to the
 /// response body. Small enough that the whole pipeline stays far below the pod's
@@ -273,15 +285,18 @@ pub struct AppState {
     /// The largest upload body accepted, in bytes: [`MAX_UPLOAD_BYTES`] in the
     /// service.
     pub upload_limit: u64,
+    /// The largest tournament match replay accepted, in bytes:
+    /// [`MAX_MATCH_REPLAY_BYTES`] in the service.
+    pub replay_limit: u64,
     /// The backend base URL (no trailing slash) an upload's per-job token is
     /// verified against.
     pub backend_url: Arc<String>,
     /// The HTTP client the upload-auth verify call uses.
     pub http: reqwest::Client,
-    /// The shared control-plane service token the backend's two management routes —
-    /// the run-tree delete and the `GET /runs` listing — must present, or `None` when
-    /// tree management is disabled (both routes then reject every caller). See
-    /// [`crate::auth::verify_service_token`].
+    /// The shared control-plane service token the backend's routes — the run-tree
+    /// delete, the `GET /runs` listing, `publish-media` and the two tournament
+    /// replay routes — must present, or `None` when they are disabled (they then
+    /// reject every caller). See [`crate::auth::verify_service_token`].
     pub service_token: Option<Arc<String>>,
     /// The Access verifier an edge request's assertion is checked with, or `None`
     /// when the service takes a person's identity from the local identity header.
@@ -321,7 +336,14 @@ fn routes() -> Router<AppState> {
         // service token; the CLI through the edge with an Access service token).
         // No `DefaultBodyLimit` layer, as for the upload: the body is streamed and
         // capped as it is read.
-        .route("/public/{*key}", put(put_public));
+        .route("/public/{*key}", put(put_public))
+        // Store or read back a tournament match's replay (backend → service, shared
+        // control-plane service token). Streamed and capped as it is read, as the
+        // public write is.
+        .route(
+            "/tournaments/{id}/matches/{match_id}/replay",
+            put(put_match_replay).get(match_replay),
+        );
     let read_routes = Router::new()
         // Serve the run's playable build and media (reviewer → service, through the
         // edge with the Access assertion), read from the run's stored tree.
@@ -1074,14 +1096,7 @@ async fn put_public(
     let content_encoding = header_text(&headers, header::CONTENT_ENCODING)?;
 
     let limit = state.upload_limit;
-    if let Some(length) =
-        header_text(&headers, header::CONTENT_LENGTH)?.and_then(|length| length.parse::<u64>().ok())
-        && length > limit
-    {
-        return Err(ApiError::payload_too_large(format!(
-            "the body is {length} bytes, over the {limit}-byte limit"
-        )));
-    }
+    refuse_declared_length(&headers, limit)?;
 
     // The cap is applied as the body is read, and a body that fails — too long, or
     // broken off by the client — fails the write before the store commits it.
@@ -1090,24 +1105,11 @@ async fn put_public(
     let written = state
         .public
         .put(&key, body, &content_type, content_encoding.as_deref())
-        .await;
-    let written = match written {
-        Ok(written) => written,
-        Err(err) => {
-            let outcome = *outcome
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            return Err(match outcome {
-                BodyOutcome::TooLarge => {
-                    ApiError::payload_too_large(format!("the body is over the {limit}-byte limit"))
-                }
-                BodyOutcome::Broken => {
-                    ApiError::bad_request(format!("the body did not arrive whole: {err}"))
-                }
-                BodyOutcome::Whole => ApiError::internal(err.to_string()),
-            });
-        }
-    };
+        .await
+        .map_err(|err| {
+            capped_write_error(&outcome, limit, &err)
+                .unwrap_or_else(|| ApiError::internal(err.to_string()))
+        })?;
     tracing::Span::current().record("bytes", written);
     tracing::info!(key = %key, bytes = written, "wrote a public object");
     Ok((
@@ -1118,6 +1120,126 @@ async fn put_public(
         }),
     )
         .into_response())
+}
+
+/// The [`put_match_replay`] response body.
+#[derive(serde::Serialize)]
+struct MatchReplayWriteOut {
+    /// The number of bytes written.
+    bytes: u64,
+}
+
+/// `PUT /tournaments/{id}/matches/{matchId}/replay` — store match `{matchId}` of
+/// tournament `{id}`'s replay, whole, with the request's body, replacing a replay
+/// already stored for the match (see [`ArtifactStore::put_match_replay`]).
+///
+/// The backend calls it with the shared control-plane service token as the arena
+/// reports a match; with no token configured every caller is refused (`401`).
+/// Either id that is not a single safe path segment is a `400`. The body is
+/// streamed into the private container, which commits it whole, so a reader sees
+/// the previous replay or the new one; a body over [`MAX_MATCH_REPLAY_BYTES`] is
+/// refused (`413`) and leaves the previous replay in place. The replay is stored
+/// as `application/json` whatever the request declares. `201 Created` with
+/// `{ "bytes" }`.
+#[tracing::instrument(name = "artifacts.put_match_replay", skip(state, headers, body), fields(tournament.id = %id, match.id = %match_id, bytes = tracing::field::Empty), err(Debug))]
+async fn put_match_replay(
+    State(state): State<AppState>,
+    Path((id, match_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    crate::auth::verify_service_token(
+        &headers,
+        state.service_token.as_deref().map(String::as_str),
+    )?;
+    let limit = state.replay_limit;
+    refuse_declared_length(&headers, limit)?;
+
+    let outcome = Arc::new(std::sync::Mutex::new(BodyOutcome::Whole));
+    let body = capped_body(body, limit, Arc::clone(&outcome));
+    let written = state
+        .store
+        .put_match_replay(&id, &match_id, body)
+        .await
+        .map_err(|err| {
+            capped_write_error(&outcome, limit, &err).unwrap_or_else(|| map_store_error(err))
+        })?;
+    tracing::Span::current().record("bytes", written);
+    tracing::info!(tournament.id = %id, match.id = %match_id, bytes = written, "stored a match replay");
+    Ok((
+        StatusCode::CREATED,
+        Json(MatchReplayWriteOut { bytes: written }),
+    )
+        .into_response())
+}
+
+/// `GET /tournaments/{id}/matches/{matchId}/replay` — match `{matchId}` of
+/// tournament `{id}`'s replay, streamed as `application/json`, for the backend to
+/// serve. Gated by the shared control-plane service token like the write; with
+/// no token configured every caller is refused (`401`). `400` for an id that is
+/// not a single safe path segment, `404` for a match with no replay stored.
+#[tracing::instrument(name = "artifacts.match_replay", skip(state, headers), fields(tournament.id = %id, match.id = %match_id), err(Debug))]
+async fn match_replay(
+    State(state): State<AppState>,
+    Path((id, match_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    crate::auth::verify_service_token(
+        &headers,
+        state.service_token.as_deref().map(String::as_str),
+    )?;
+    let object = state
+        .store
+        .match_replay(&id, &match_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "tournament `{id}` has no replay stored for match `{match_id}`"
+            ))
+        })?;
+    Ok(media_response(Served {
+        content_type: MATCH_REPLAY_CONTENT_TYPE,
+        content_encoding: None,
+        content_length: Some(object.properties.content_length),
+        body: object.body,
+    }))
+}
+
+/// Refuse (`413`) a request whose declared `Content-Length` is already over
+/// `limit`, before any of its body is read.
+fn refuse_declared_length(headers: &axum::http::HeaderMap, limit: u64) -> Result<(), ApiError> {
+    if let Some(length) =
+        header_text(headers, header::CONTENT_LENGTH)?.and_then(|length| length.parse::<u64>().ok())
+        && length > limit
+    {
+        return Err(ApiError::payload_too_large(format!(
+            "the body is {length} bytes, over the {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+/// The error a write of a [`capped_body`] failed with `err` answers, when the
+/// body itself is why: a `413` for one over `limit`, a `400` for one the client
+/// broke off. `None` when the body arrived whole, so the store is at fault.
+fn capped_write_error(
+    outcome: &std::sync::Mutex<BodyOutcome>,
+    limit: u64,
+    err: &dyn std::fmt::Display,
+) -> Option<ApiError> {
+    match *outcome
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        BodyOutcome::TooLarge => Some(ApiError::payload_too_large(format!(
+            "the body is over the {limit}-byte limit"
+        ))),
+        BodyOutcome::Broken => Some(ApiError::bad_request(format!(
+            "the body did not arrive whole: {err}"
+        ))),
+        BodyOutcome::Whole => None,
+    }
 }
 
 /// How a capped request body ended, recorded as it is read.
@@ -1181,14 +1303,16 @@ fn header_text(
 }
 
 /// Map a [`StoreError`] onto the HTTP envelope: what the caller sent wrong is a
-/// `400` (a traversal entry or unsafe id, an unusable archive, a body that failed
-/// to arrive) or a `413` (a body over the limit); a read of an unknown run's tree is
+/// `400` (a traversal entry or unsafe id, a reserved run id, an unusable archive,
+/// a body that failed to arrive) or a `413` (a body over the limit); a read of an unknown run's tree is
 /// a `404`; a store fault is the service's (`500`).
 fn map_store_error(err: StoreError) -> ApiError {
     match err {
-        StoreError::Traversal(_) | StoreError::Archive(_) | StoreError::UploadBody(_) => {
-            ApiError::bad_request(err.to_string())
-        }
+        StoreError::Traversal(_)
+        | StoreError::ReservedId(_)
+        | StoreError::UnsafeSegment(_)
+        | StoreError::Archive(_)
+        | StoreError::UploadBody(_) => ApiError::bad_request(err.to_string()),
         StoreError::TooLarge(_) => ApiError::payload_too_large(err.to_string()),
         StoreError::NotFound(_) => ApiError::not_found(err.to_string()),
         StoreError::Backend(_)
@@ -1213,3 +1337,7 @@ mod stream_tests;
 #[cfg(test)]
 #[path = "api.publish.test.rs"]
 mod publish_tests;
+
+#[cfg(test)]
+#[path = "api.tournaments.test.rs"]
+mod tournament_tests;
