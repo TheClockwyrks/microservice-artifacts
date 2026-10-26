@@ -54,7 +54,6 @@ http = "1"
 # RS256 through the pure-Rust `rust_crypto` backend, so the portable musl build
 # needs no C toolchain; no PEM parsing, since the keys arrive as JWK components.
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
-md-5 = "0.10"
 opentelemetry = "0.32"
 percent-encoding = "2"
 # TLS through rustls so the image needs no system OpenSSL; `json` for the

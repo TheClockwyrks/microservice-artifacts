@@ -798,12 +798,29 @@ async fn a_container_serves_as_the_public_store() {
             .unwrap(),
         ["media/runs/r/proof/a.png"]
     );
+    assert_eq!(
+        PublicStore::list(&store, "media/").await.unwrap(),
+        [crate::public::PublicObject {
+            key: "media/runs/r/proof/a.png".to_string(),
+            bytes: 3,
+            last_modified: Some(time::macros::datetime!(2026-10-19 12:03:04 UTC)),
+        }]
+    );
     assert!(
         PublicStore::head(&store, "missing")
             .await
             .unwrap()
             .is_none()
     );
+
+    // A delete removes the object, and deleting it again still succeeds.
+    PublicStore::delete(&store, "media/runs/r/proof/a.png")
+        .await
+        .unwrap();
+    PublicStore::delete(&store, "media/runs/r/proof/a.png")
+        .await
+        .unwrap();
+    assert!(PublicStore::list(&store, "").await.unwrap().is_empty());
 }
 
 /// The configuration of a service against the stub's emulator account.

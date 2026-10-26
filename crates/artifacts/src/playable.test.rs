@@ -407,10 +407,7 @@ async fn tree_with_validation(validation: ValidationSummary, media: &[(&str, &[u
             ..RunMetrics::default()
         },
         validation,
-        links: RunLinks {
-            source_repo: None,
-            playable_build: None,
-        },
+        links: RunLinks::default(),
         status: RunStatus {
             state: RunState::Completed,
             detail: None,

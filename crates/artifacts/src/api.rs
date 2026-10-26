@@ -34,6 +34,10 @@
 //!   `PUT /public/{key}`; the **CLI** writes an asset reference with the same
 //!   route, through the edge with an Access service token (see
 //!   [`crate::publish`]).
+//! - The **backend** lists the public objects under a prefix,
+//!   `GET /public?prefix=`, and deletes one, `DELETE /public/{key}`, for its
+//!   publish's skip sets, its prune of superseded snapshot generations and its
+//!   discovery of asset references, with the service token alone.
 //! - The **backend** stores each tournament match's replay as the arena reports
 //!   it, `PUT /tournaments/{id}/matches/{matchId}/replay`, and reads it back to
 //!   serve it, `GET` of the same path, both with the service token (see
@@ -55,7 +59,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Extension, OriginalUri, Path, Request, State};
+use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -79,7 +83,9 @@ use crate::auth::{
 };
 use crate::error::ApiError;
 use crate::public::PublicStore;
-use crate::publish::{PublishError, Transcoder, check_public_key, publish_run_media};
+use crate::publish::{
+    PublishError, Transcoder, check_public_key, check_public_prefix, publish_run_media,
+};
 use crate::store::tournaments::MATCH_REPLAY_CONTENT_TYPE;
 use crate::store::{ArchiveShape, ArtifactStore, StoreError, start_archive, write_archive};
 
@@ -293,16 +299,18 @@ pub struct AppState {
     pub backend_url: Arc<String>,
     /// The HTTP client the upload-auth verify call uses.
     pub http: reqwest::Client,
-    /// The shared control-plane service token the backend's routes — the run-tree
-    /// delete, the `GET /runs` listing, `publish-media` and the two tournament
-    /// replay routes — must present, or `None` when they are disabled (they then
-    /// reject every caller). See [`crate::auth::verify_service_token`].
+    /// The shared control-plane service token the backend's routes present: the
+    /// run-tree delete, the `GET /runs` listing, `publish-media`, its
+    /// `PUT /public/{key}` writes, the `GET /public` listing, `DELETE /public/{key}`
+    /// and the two tournament replay routes. `None` when the service has no token
+    /// configured, and every one of those routes then refuses the backend. See
+    /// [`crate::auth::verify_service_token`].
     pub service_token: Option<Arc<String>>,
     /// The Access verifier an edge request's assertion is checked with, or `None`
     /// when the service takes a person's identity from the local identity header.
     pub access: AccessMode,
     /// The public dataset's store, which `publish-media` and `PUT /public/{key}`
-    /// write.
+    /// write, `GET /public` lists and `DELETE /public/{key}` deletes from.
     pub public: Arc<dyn PublicStore>,
     /// What transcodes a published webm clip to mp4.
     pub transcoder: Arc<dyn Transcoder>,
@@ -335,8 +343,12 @@ fn routes() -> Router<AppState> {
         // Write one object of the public dataset (backend → service with the
         // service token; the CLI through the edge with an Access service token).
         // No `DefaultBodyLimit` layer, as for the upload: the body is streamed and
-        // capped as it is read.
-        .route("/public/{*key}", put(put_public))
+        // capped as it is read. Delete one object of it (backend → service, the
+        // service token alone), pruning a superseded snapshot generation.
+        .route("/public/{*key}", put(put_public).delete(delete_public))
+        // List the public objects under a prefix (backend → service, the service
+        // token alone).
+        .route("/public", get(list_public))
         // Store or read back a tournament match's replay (backend → service, shared
         // control-plane service token). Streamed and capped as it is read, as the
         // public write is.
@@ -1120,6 +1132,115 @@ async fn put_public(
         }),
     )
         .into_response())
+}
+
+/// The query of [`list_public`].
+#[derive(serde::Deserialize)]
+struct ListPublicQuery {
+    /// The key prefix to list under; absent or empty lists the whole bucket.
+    prefix: Option<String>,
+}
+
+/// One entry of the [`list_public`] response.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicObjectOut {
+    /// The object's key.
+    key: String,
+    /// Its size in bytes.
+    bytes: u64,
+    /// When it was last written, RFC 3339 in UTC; `null` when the store did not
+    /// report it.
+    modified_at: Option<String>,
+}
+
+/// The [`list_public`] response body.
+#[derive(serde::Serialize)]
+struct PublicListingOut {
+    objects: Vec<PublicObjectOut>,
+}
+
+/// `GET /public?prefix={prefix}` — list every object of the public dataset whose
+/// key starts with `prefix`, with its size and last-modified time, in name order.
+///
+/// The backend is the caller: it learns which objects a publish need not write
+/// again, which superseded snapshot generations to prune, and which asset
+/// references are published. The prune deletes on this answer, so the route
+/// takes the shared control-plane service token alone, as `GET /runs` does; an
+/// Access assertion, a person's or a service token's, is refused (`401`). With
+/// no token configured every caller is refused (`401`).
+///
+/// An absent or empty prefix lists the whole bucket; one that does not name
+/// whole segments plainly is refused (`400`, see [`check_public_prefix`]). The
+/// store's paging is followed here, so the answer is one response: `200 OK` with
+/// `{ "objects": [{ "key", "bytes", "modifiedAt" }] }`.
+#[tracing::instrument(name = "artifacts.list_public", skip(state, headers, query), fields(prefix = tracing::field::Empty, objects = tracing::field::Empty), err(Debug))]
+async fn list_public(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<ListPublicQuery>,
+) -> Result<Response, ApiError> {
+    crate::auth::verify_service_token(
+        &headers,
+        state.service_token.as_deref().map(String::as_str),
+    )?;
+    let prefix = query.prefix.unwrap_or_default();
+    tracing::Span::current().record("prefix", prefix.as_str());
+    check_public_prefix(&prefix)
+        .map_err(|reason| ApiError::bad_request(format!("prefix `{prefix}`: {reason}")))?;
+
+    let listed = state
+        .public
+        .list(&prefix)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    let mut objects = Vec::with_capacity(listed.len());
+    for object in listed {
+        let modified_at = object
+            .last_modified
+            .map(|at| at.to_offset(time::UtcOffset::UTC).format(&Rfc3339))
+            .transpose()
+            .map_err(|err| {
+                ApiError::internal(format!("formatting a public object's modified time: {err}"))
+            })?;
+        objects.push(PublicObjectOut {
+            key: object.key,
+            bytes: object.bytes,
+            modified_at,
+        });
+    }
+    tracing::Span::current().record("objects", objects.len());
+    Ok((StatusCode::OK, Json(PublicListingOut { objects })).into_response())
+}
+
+/// `DELETE /public/{key}` — delete one object of the public dataset.
+///
+/// The backend calls it to prune the snapshot generations nothing points at any
+/// more. A delete is destructive, so the route takes the shared control-plane
+/// service token alone; an Access assertion, a person's or a service token's, is
+/// refused (`401`), as is every caller when no token is configured. A key that
+/// does not name one object plainly is refused (`400`, see [`check_public_key`]).
+/// Idempotent: deleting a key the store does not hold succeeds. `204 No Content`.
+#[tracing::instrument(name = "artifacts.delete_public", skip(state, headers), fields(key = %key), err(Debug))]
+async fn delete_public(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    crate::auth::verify_service_token(
+        &headers,
+        state.service_token.as_deref().map(String::as_str),
+    )?;
+    check_public_key(&key)
+        .map_err(|reason| ApiError::bad_request(format!("key `{key}`: {reason}")))?;
+    state
+        .public
+        .delete(&key)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    tracing::info!(key = %key, "deleted a public object");
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// The [`put_match_replay`] response body.

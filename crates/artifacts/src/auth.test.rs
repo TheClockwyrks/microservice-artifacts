@@ -586,6 +586,49 @@ async fn publishing_media_takes_the_service_token_alone() {
     );
 }
 
+#[tokio::test]
+async fn listing_and_deleting_public_objects_take_the_service_token_alone() {
+    let (_dir, app) = verifying_service().await;
+    let service = KEY_A.sign(&service_claims("tcab-cli.access", AUDIENCE));
+    let person = KEY_A.sign(&person_claims("ada@example.com", AUDIENCE));
+    let job = bearer(JOB_TOKEN);
+    let routes = [
+        ("GET", "/public?prefix=media/"),
+        ("GET", "/artifacts/public?prefix=media/"),
+        ("DELETE", "/public/index.json"),
+        ("DELETE", "/artifacts/public/index.json"),
+    ];
+    // Neither the CLI's Access service token, which may write, nor a person, nor
+    // another in-cluster token lists or deletes a public object.
+    for headers in [
+        vec![(ASSERTION_HEADER, service.as_str())],
+        vec![(ASSERTION_HEADER, person.as_str())],
+        vec![("authorization", job.as_str())],
+        vec![],
+    ] {
+        for (method, uri) in routes {
+            assert_eq!(
+                send(&app, method, uri, &headers, b"").await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} {headers:?}"
+            );
+        }
+    }
+    let token = bearer(SERVICE_TOKEN);
+    for (method, uri) in routes {
+        let expected = if method == "GET" {
+            StatusCode::OK
+        } else {
+            StatusCode::NO_CONTENT
+        };
+        assert_eq!(
+            send(&app, method, uri, &[("authorization", &token)], b"").await,
+            expected,
+            "{method} {uri}"
+        );
+    }
+}
+
 #[test]
 fn a_public_write_is_authorized_by_identity() {
     use super::authorize_public_write;
