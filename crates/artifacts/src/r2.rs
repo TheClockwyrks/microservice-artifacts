@@ -29,7 +29,7 @@ use crate::object::{
     ByteRange, ObjectBody, ObjectProperties, ObjectStream, PIECE_SIZE, Pieces, first_pieces,
     properties_from_headers, response_body,
 };
-use crate::public::PublicObject;
+use crate::public::{PublicObject, cache_control};
 
 /// An R2 request failed: the object store could not be reached, or it rejected a
 /// signed request. Carries the key or prefix
@@ -366,7 +366,7 @@ impl R2Client {
                 Some(key),
                 &[],
                 Vec::new(),
-                labels(content_type, content_encoding),
+                labels(key, content_type, content_encoding),
                 &payload_hash,
                 Some(body),
             )
@@ -391,7 +391,7 @@ impl R2Client {
                 Some(key),
                 &[("uploads", String::new())],
                 Vec::new(),
-                labels(content_type, content_encoding),
+                labels(key, content_type, content_encoding),
                 EMPTY_PAYLOAD_HASH,
                 None,
             )
@@ -637,9 +637,17 @@ impl R2Client {
     }
 }
 
-/// The unsigned content-label headers a write stores on its object.
-fn labels(content_type: &str, content_encoding: Option<&str>) -> Vec<(&'static str, String)> {
-    let mut headers = vec![("content-type", content_type.to_string())];
+/// The unsigned content-label headers a write stores on object `key`, its
+/// [cache policy](cache_control) among them.
+fn labels(
+    key: &str,
+    content_type: &str,
+    content_encoding: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
+        ("content-type", content_type.to_string()),
+        ("cache-control", cache_control(key).to_string()),
+    ];
     if let Some(encoding) = content_encoding {
         headers.push(("content-encoding", encoding.to_string()));
     }

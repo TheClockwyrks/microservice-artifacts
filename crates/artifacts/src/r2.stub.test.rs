@@ -20,6 +20,7 @@ struct Stored {
     data: Bytes,
     content_type: Option<String>,
     content_encoding: Option<String>,
+    cache_control: Option<String>,
 }
 
 /// An open multipart upload: the key, its labels and its parts.
@@ -27,6 +28,7 @@ struct Upload {
     key: String,
     content_type: Option<String>,
     content_encoding: Option<String>,
+    cache_control: Option<String>,
     parts: BTreeMap<usize, Bytes>,
 }
 
@@ -174,6 +176,7 @@ async fn handle(
                     data: body,
                     content_type: header(&headers, "content-type"),
                     content_encoding: header(&headers, "content-encoding"),
+                    cache_control: header(&headers, "cache-control"),
                 },
             );
             status(200, "")
@@ -188,6 +191,7 @@ async fn handle(
                     key,
                     content_type: header(&headers, "content-type"),
                     content_encoding: header(&headers, "content-encoding"),
+                    cache_control: header(&headers, "cache-control"),
                     parts: BTreeMap::new(),
                 },
             );
@@ -219,6 +223,7 @@ async fn handle(
                     data: Bytes::from(data),
                     content_type: upload.content_type,
                     content_encoding: upload.content_encoding,
+                    cache_control: upload.cache_control,
                 },
             );
             status(200, "<CompleteMultipartUploadResult/>")
@@ -394,7 +399,33 @@ async fn a_small_body_is_one_put() {
         .await
         .unwrap();
     assert_eq!(written, 2);
-    assert_eq!(stub.lock().unwrap().log, ["PUT"]);
+    let stub = stub.lock().unwrap();
+    assert_eq!(stub.log, ["PUT"]);
+    assert_eq!(
+        stub.objects["index.json"].cache_control.as_deref(),
+        Some("public, max-age=60"),
+        "the pointer takes a short freshness window"
+    );
+}
+
+#[tokio::test]
+async fn every_object_but_the_pointer_is_stored_immutable() {
+    let (client, stub) = serve().await;
+    for key in [
+        "codes/0123abcd",
+        "snapshots/2026-06-17T2148Z-1a7b9c3d/runs.json",
+        "documents/runs/r/abc.json",
+    ] {
+        client
+            .upload(key, body_from_bytes(&b"x"[..]), "text/plain", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.lock().unwrap().objects[key].cache_control.as_deref(),
+            Some("public, max-age=31536000, immutable"),
+            "{key}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -436,6 +467,13 @@ async fn a_large_body_is_a_multipart_upload_of_equal_parts() {
         .unwrap();
     assert_eq!(read.properties.content_type.as_deref(), Some("video/mp4"));
     assert_eq!(collect_body(read.body).await.unwrap(), data);
+    assert_eq!(
+        stub.lock().unwrap().objects["media/runs/r/proof/clip.mp4"]
+            .cache_control
+            .as_deref(),
+        Some("public, max-age=31536000, immutable"),
+        "a multipart upload carries the labels its creation named"
+    );
 }
 
 #[tokio::test]

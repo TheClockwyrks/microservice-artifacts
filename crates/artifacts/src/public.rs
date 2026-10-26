@@ -34,6 +34,25 @@ pub enum PublicStoreError {
     Blob(#[from] BlobError),
 }
 
+/// The key of the pointer every reader of the bucket starts from.
+pub const POINTER_KEY: &str = "index.json";
+
+/// The `Cache-Control` stored on public object `key`, which the bucket's
+/// custom domain serves it with.
+///
+/// The pointer is replaced by every publish, so it takes a short freshness
+/// window. Every other object is written once under a key that is never
+/// rewritten (a generation's index objects, a content-addressed document or
+/// media file, a `codes/` object), so it is cached indefinitely. See the
+/// Serving page's "Caching" section.
+pub fn cache_control(key: &str) -> &'static str {
+    if key == POINTER_KEY {
+        "public, max-age=60"
+    } else {
+        "public, max-age=31536000, immutable"
+    }
+}
+
 /// Which store an environment's public dataset lives in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicStoreConfig {
