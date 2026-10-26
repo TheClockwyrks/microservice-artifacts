@@ -6,19 +6,36 @@
 //! further [`DRAIN_DELAY`], so a request routed by an endpoint list not yet
 //! updated still lands. Then it stops accepting and finishes every request in
 //! flight, a run-tree upload or a streamed download among them, and exits with
-//! status 0. An interrupt at a terminal skips the drain delay. The service holds
-//! no long-lived stream, so there is none to close.
+//! status 0, at the latest [`STOP_DEADLINE`] after the signal, abandoning
+//! whatever is still running then so the exit stays inside the pod's grace. An
+//! interrupt at a terminal skips the drain delay. The service holds no
+//! long-lived stream, so there is none to close.
+//!
+//! The signal handlers are installed before the start ([`stop_signal`]), so a
+//! stop that arrives while the service is still waiting for its run-tree
+//! container ends the start and exits 0 too, rather than killing the process.
 //!
 //! Liveness (`GET /healthz`) is untouched by all of this: a draining process is
 //! alive and still serving the requests it holds.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use tokio::sync::watch;
+use tokio::time::Instant;
+
 /// How long the service keeps accepting requests after `SIGTERM`, answering its
 /// readiness probe `503` meanwhile.
 pub const DRAIN_DELAY: Duration = Duration::from_secs(5);
+
+/// How long after the stop the process exits however much is still in flight.
+///
+/// The service's termination grace is 300 seconds and starts with the
+/// 5-second `preStop` hook that precedes `SIGTERM`, so 290 seconds from the
+/// signal leaves a margin of 5 before the kubelet would kill the process.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(290);
 
 /// Whether the service is ready to take new requests: until it is told to stop.
 ///
@@ -72,38 +89,91 @@ impl Stop {
     }
 }
 
-/// Resolve on `SIGTERM` or on `Ctrl-C`, answering which.
-pub async fn stop_requested() -> Stop {
-    let interrupt = tokio::signal::ctrl_c();
+/// Install the handlers for `SIGTERM` and the interrupt, and answer a future
+/// that resolves when either arrives, naming which.
+///
+/// The handlers are installed by this call, not when the future is first
+/// polled, so a signal delivered at any point afterwards is held for the future
+/// rather than ending the process by the signal's default action. Call it before
+/// anything that can take time, the start's wait for the run-tree container
+/// among it, so a stop is never lost to a slow start.
+pub fn stop_signal() -> std::io::Result<impl Future<Output = Stop> + Send + 'static> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(terminate) => terminate,
-            Err(err) => {
-                tracing::warn!("cannot listen for SIGTERM ({err}); stopping on Ctrl-C only");
-                let _ = interrupt.await;
-                return Stop::Interrupt;
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => Stop::Terminate,
+                _ = interrupt.recv() => Stop::Interrupt,
             }
-        };
-        tokio::select! {
-            _ = interrupt => Stop::Interrupt,
-            _ = terminate.recv() => Stop::Terminate,
-        }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = interrupt.await;
-        Stop::Interrupt
+        Ok(async move {
+            // Only an interrupt reaches a process here. An error installing its
+            // handler leaves no way to be asked to stop, so wait forever then.
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => Stop::Interrupt,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not listen for an interrupt");
+                    std::future::pending().await
+                }
+            }
+        })
     }
 }
 
-/// The future a server's graceful shutdown waits on: resolves once `stop`
-/// resolves, readiness has been failed and the stop's drain delay has passed.
+/// A stop request every part of the process can wait on: the start, the
+/// server's drain and the stop deadline. Cloneable; every clone sees the one
+/// request, with the moment it arrived.
+#[derive(Clone, Debug)]
+pub struct StopRequest {
+    requested: watch::Receiver<Option<(Stop, Instant)>>,
+}
+
+impl StopRequest {
+    /// Wait on `stop` in a task of its own, recording what it answers and when.
+    /// Must be called inside a Tokio runtime.
+    pub fn spawn(stop: impl Future<Output = Stop> + Send + 'static) -> Self {
+        let (sender, requested) = watch::channel(None);
+        tokio::spawn(async move {
+            let stop = stop.await;
+            tracing::info!(signal = ?stop, "stop requested");
+            sender.send_replace(Some((stop, Instant::now())));
+            // Keep the sender, so a waiter never sees the channel close.
+            std::future::pending::<()>().await;
+        });
+        Self { requested }
+    }
+
+    /// Resolve once the stop was requested, answering what requested it and
+    /// when. Resolves at once when it already was.
+    pub async fn requested(&self) -> (Stop, Instant) {
+        let mut requested = self.requested.clone();
+        let request = requested
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|value| *value);
+        match request {
+            Some(request) => request,
+            // The task holds the sender forever; a closed channel means the
+            // runtime is going away, and no stop will come.
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// The future a server's graceful shutdown waits on: resolves once the stop is
+/// requested, readiness has been failed and the stop's drain delay has passed.
 /// The server stops accepting when it resolves and then finishes the requests
 /// in flight.
-pub async fn drain(readiness: Readiness, stop: impl std::future::Future<Output = Stop>) -> Stop {
-    let stop = stop.await;
+pub async fn drain(readiness: Readiness, stop: StopRequest) -> Stop {
+    let (stop, at) = stop.requested().await;
     readiness.mark_draining();
     let delay = stop.drain_delay();
     tracing::info!(
@@ -111,9 +181,16 @@ pub async fn drain(readiness: Readiness, stop: impl std::future::Future<Output =
         drain_delay_ms = delay.as_millis() as u64,
         "stopping: readiness failed, draining"
     );
-    tokio::time::sleep(delay).await;
+    tokio::time::sleep_until(at + delay).await;
     tracing::info!("stopping: no longer accepting; finishing the requests in flight");
     stop
+}
+
+/// Resolve [`STOP_DEADLINE`] after the stop was requested: the moment the
+/// process exits however much is still in flight.
+pub async fn deadline(stop: StopRequest) {
+    let (_, at) = stop.requested().await;
+    tokio::time::sleep_until(at + STOP_DEADLINE).await;
 }
 
 #[cfg(test)]

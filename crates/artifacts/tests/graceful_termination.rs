@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,9 +41,19 @@ const POLL: Duration = Duration::from_millis(25);
 /// The blobs the stub holds, by `<container>/<name>`.
 type Blobs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+/// The stub's state: the blobs it holds, whether it refuses every listing (a
+/// container the start cannot reach yet), and how many listings it was asked
+/// for.
+#[derive(Clone, Default)]
+struct Stub {
+    blobs: Blobs,
+    refuse_listings: bool,
+    listings: Arc<AtomicUsize>,
+}
+
 /// The stub Blob service: creates containers, lists none, keeps every
 /// `Put Blob`.
-async fn stub_blob(State(blobs): State<Blobs>, request: Request) -> Response {
+async fn stub_blob(State(stub): State<Stub>, request: Request) -> Response {
     let query = request.uri().query().unwrap_or("").to_string();
     let path = request.uri().path().to_string();
     let name = path
@@ -54,6 +65,10 @@ async fn stub_blob(State(blobs): State<Blobs>, request: Request) -> Response {
         return StatusCode::CREATED.into_response();
     }
     if method == Method::GET && query.contains("comp=list") {
+        stub.listings.fetch_add(1, Ordering::SeqCst);
+        if stub.refuse_listings {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return (
             StatusCode::OK,
             [("content-type", "application/xml")],
@@ -66,21 +81,24 @@ async fn stub_blob(State(blobs): State<Blobs>, request: Request) -> Response {
         let body = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .unwrap();
-        blobs.lock().unwrap().insert(name, body.to_vec());
+        stub.blobs.lock().unwrap().insert(name, body.to_vec());
         return StatusCode::CREATED.into_response();
     }
     StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 async fn spawn_stub() -> (SocketAddr, Blobs) {
-    let blobs = Blobs::default();
-    let app = Router::new()
-        .fallback(stub_blob)
-        .with_state(Arc::clone(&blobs));
+    let stub = Stub::default();
+    let blobs = Arc::clone(&stub.blobs);
+    (serve_stub(stub).await, blobs)
+}
+
+async fn serve_stub(stub: Stub) -> SocketAddr {
+    let app = Router::new().fallback(stub_blob).with_state(stub);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (addr, blobs)
+    addr
 }
 
 /// A loopback port nothing listens on at the moment.
@@ -300,5 +318,37 @@ async fn an_interrupt_skips_the_drain_delay_and_exits_cleanly() {
     // With no request in flight and no drain delay, the exit comes well inside
     // the 5 s a `SIGTERM` would keep accepting for.
     let status = wait_exit(&mut service, Duration::from_secs(4)).await;
+    assert!(status.success(), "the service exited with {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_during_the_start_exits_cleanly() {
+    // A container the start cannot reach yet keeps it retrying.
+    let stub = Stub {
+        refuse_listings: true,
+        ..Stub::default()
+    };
+    let listings = Arc::clone(&stub.listings);
+    let addr = serve_stub(stub).await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut service = spawn_service(addr, port, dir.path());
+
+    // Wait until the start has been refused at least once: it is in its retry
+    // loop, long after the handlers would have been installed.
+    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    while listings.load(Ordering::SeqCst) == 0 {
+        if let Some(status) = service.try_wait().unwrap() {
+            panic!("the service exited during its start: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the start never reached the container"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    signal(&service, "TERM");
+    let status = wait_exit(&mut service, STEP_TIMEOUT).await;
     assert!(status.success(), "the service exited with {status}");
 }

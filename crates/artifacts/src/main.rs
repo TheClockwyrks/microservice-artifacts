@@ -3,7 +3,8 @@
 //! Resolves configuration from the environment, builds the service, and serves
 //! the Axum router until told to stop, then drains: `SIGTERM` fails readiness at
 //! once, keeps accepting for the drain delay, then stops accepting and finishes
-//! every request in flight before exiting 0; `Ctrl-C` skips the delay (see
+//! every request in flight before exiting 0, at the latest at the stop deadline;
+//! `Ctrl-C` skips the delay. A stop during the start exits 0 at once (see
 //! [`test_cabinet_artifacts::shutdown`]). Every route but the health probe needs an
 //! identity: the Access assertion an edge request carries, verified against
 //! `TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE`, or one of the in-cluster
@@ -13,14 +14,43 @@
 use std::process::ExitCode;
 
 use test_cabinet_artifacts::config::Config;
+use test_cabinet_artifacts::shutdown::{self, STOP_DEADLINE, StopRequest};
 
 /// How many times the start tries to reach the run-tree container.
 const PREPARE_ATTEMPTS: u32 = 30;
 /// The wait between two of those attempts.
 const PREPARE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("could not start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(serve());
+    // An upload still unpacking past the stop deadline runs on a blocking thread,
+    // which dropping the runtime would wait for; it is abandoned instead.
+    runtime.shutdown_background();
+    code
+}
+
+/// Start the service, serve it until it is told to stop, then drain it.
+async fn serve() -> ExitCode {
+    // Install the signal handlers before anything that can take time, so a stop
+    // during the start ends it cleanly instead of killing the process.
+    let stop = match shutdown::stop_signal() {
+        Ok(signal) => StopRequest::spawn(signal),
+        Err(err) => {
+            eprintln!("could not listen for the stop signals: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Load `.env.artifacts` beside the project before anything reads the
     // environment. A missing file is fine (variables can be exported instead);
     // `dotenvy` never overrides already-set variables. This runs before telemetry
@@ -64,30 +94,18 @@ async fn main() -> ExitCode {
         "artifact service configuration resolved"
     );
 
-    // Make the run-tree container ready before serving: an emulator's containers
-    // are created, and in every mode one listing proves the credential and the
-    // container. The emulator, or the identity's token exchange, may still be
-    // coming up beside this pod, so a refused attempt is retried for a while
-    // before the start is given up.
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match test_cabinet_artifacts::prepare_run_container(&config).await {
-            Ok(created) => {
-                for container in created {
-                    tracing::info!(blob.container = %container, "created emulator container");
-                }
-                break;
-            }
-            Err(err) if attempt < PREPARE_ATTEMPTS => {
-                tracing::warn!(attempt, error = %err, "run-tree container not reachable yet; retrying");
-                tokio::time::sleep(PREPARE_RETRY_DELAY).await;
-            }
-            Err(err) => {
-                eprintln!("the run-tree container is not reachable: {err}");
-                return ExitCode::FAILURE;
-            }
+    // Make the run-tree container ready before serving (see `prepare`). A stop
+    // requested meanwhile ends the start, and the process exits 0: there is
+    // nothing to drain yet.
+    let prepared = tokio::select! {
+        prepared = prepare(&config) => prepared,
+        (signal, _) = stop.requested() => {
+            tracing::info!(?signal, "stopped during the start");
+            return ExitCode::SUCCESS;
         }
+    };
+    if !prepared {
+        return ExitCode::FAILURE;
     }
 
     let service = match test_cabinet_artifacts::build(config) {
@@ -110,19 +128,57 @@ async fn main() -> ExitCode {
     // Told to stop, fail readiness so the endpoint leaves the Service, keep
     // accepting for the drain delay, then stop accepting and finish the requests in
     // flight before exiting (the control plane's "Graceful termination").
-    let shutdown = test_cabinet_artifacts::shutdown::drain(
-        service.readiness,
-        test_cabinet_artifacts::shutdown::stop_requested(),
-    );
-    if let Err(err) = axum::serve(listener, service.router)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-        })
-        .await
-    {
-        eprintln!("server error: {err}");
-        return ExitCode::FAILURE;
+    // Past the stop deadline the process exits with whatever is still in flight,
+    // inside the pod's termination grace.
+    let draining = shutdown::drain(service.readiness, stop.clone());
+    let served = axum::serve(listener, service.router).with_graceful_shutdown(async move {
+        draining.await;
+    });
+    tokio::select! {
+        result = served => match result {
+            Ok(()) => {
+                tracing::info!("artifact service stopped");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("server error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        () = shutdown::deadline(stop) => {
+            tracing::warn!(
+                deadline_secs = STOP_DEADLINE.as_secs(),
+                "the stop deadline passed with requests still in flight; abandoning them"
+            );
+            ExitCode::SUCCESS
+        }
     }
-    tracing::info!("artifact service stopped");
-    ExitCode::SUCCESS
+}
+
+/// Make the run-tree container ready, retrying while it is not reachable yet:
+/// an emulator's containers are created, and in every mode one listing proves the
+/// credential and the container. The emulator, or the identity's token exchange,
+/// may still be coming up beside this pod, so a refused attempt is retried for a
+/// while before the start is given up. Answers whether it is ready.
+async fn prepare(config: &Config) -> bool {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match test_cabinet_artifacts::prepare_run_container(config).await {
+            Ok(created) => {
+                for container in created {
+                    tracing::info!(blob.container = %container, "created emulator container");
+                }
+                return true;
+            }
+            Err(err) if attempt < PREPARE_ATTEMPTS => {
+                tracing::warn!(attempt, error = %err, "run-tree container not reachable yet; retrying");
+                tokio::time::sleep(PREPARE_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                eprintln!("the run-tree container is not reachable: {err}");
+                return false;
+            }
+        }
+    }
 }
